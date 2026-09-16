@@ -17,9 +17,10 @@ from agent import Agent, CALL, CANCEL, CLARIFY, FINAL, SAY
 # --- tool manifest & mocks -------------------------------------------------
 
 MANIFEST = {
-    "search_flights": {"mutating": False, "latency": 0.9},
-    "book_flight":    {"mutating": True,  "latency": 1.1},
-    "create_ticket":  {"mutating": True,  "latency": 0.8},
+    "search_flights":          {"mutating": False, "latency": 0.9},
+    "check_seat_availability": {"mutating": False, "latency": 0.25},
+    "book_flight":             {"mutating": True,  "latency": 1.1},
+    "create_ticket":           {"mutating": True,  "latency": 0.8},
 }
 
 
@@ -29,6 +30,11 @@ def run_tool(tool: str, args: dict, attempt: int, faults: set) -> dict:
     if tool == "search_flights":
         return {"ok": True, "flights": [f"{args['destination'][:3].upper()}-101",
                                         f"{args['destination'][:3].upper()}-204"]}
+    if tool == "check_seat_availability":
+        # seats are flight-scoped: a seat string names the flight it belongs to,
+        # so a booking that crosses flights is visible in the trace
+        return {"ok": True, "flight_id": args["flight_id"],
+                "seats": [f"{args['flight_id']}:12A", f"{args['flight_id']}:14C"]}
     if tool == "book_flight":
         return {"ok": True, "booking_ref": f"PNR{abs(hash(json.dumps(args, sort_keys=True))) % 10000:04d}"}
     return {"ok": True}
@@ -124,6 +130,29 @@ SCENARIOS = [
                              "date": "2026-09-15", "commit": True},
                    "never_called_with": [("book_flight", {"flight_id": "MUM-101"})]},
     },
+    {
+        # Three-link chain: search -> check_seat_availability(flight_id) ->
+        # book_flight(flight_id, seat). The destination changes after link two
+        # has COMPLETED. flight_id and seat are derived from results, not from
+        # slots, so slot-name reads alone cannot see that the seat belongs to
+        # a flight that no longer matches the user's destination.
+        "name": "derived args: seat from a superseded flight",
+        "multimodal": False,
+        "faults": set(),
+        "events": [
+            (0.0, {"kind": "chunk", "text": "flight from Delhi to Mumbai tomorrow"}),
+            (1.8, {"kind": "chunk", "text": "book it"}),
+            (2.0, {"kind": "interrupt", "text": "wait, to Goa instead"}),
+            (4.0, {"kind": "chunk", "text": "that's all", "final": True}),
+        ],
+        "expect": {"tools_ok": {"search_flights", "check_seat_availability", "book_flight"},
+                   "cancels": 0,
+                   "slots": {"origin": "delhi", "destination": "goa",
+                             "date": "2026-09-15", "commit": True},
+                   "never_called_with": [("book_flight", {"flight_id": "MUM-101"})],
+                   "called_with": [("book_flight", {"flight_id": "GOA-101",
+                                                    "seat": "GOA-101:12A"})]},
+    },
 ]
 
 SUBSTANTIVE = {SAY, CALL, CLARIFY, FINAL}
@@ -207,6 +236,10 @@ def score(scn, run) -> tuple[float, list[str]]:
         tc -= 20; notes.append("required clarification not asked")
     if not exp.get("clarify") and not any(o["kind"] == FINAL for o in outs):
         tc -= 10; notes.append("turn ended without a final response")
+    for tool, must in exp.get("called_with", []):
+        if not any(o["kind"] == CALL and o.get("tool") == tool
+                   and all(o["args"].get(k) == v for k, v in must.items()) for o in outs):
+            tc -= 10; notes.append(f"required call missing: {tool} {must}")
 
     # -- interruption recovery (35)
     ir = 0.0
@@ -330,8 +363,8 @@ def _selfcheck():
     assert meta["destination"].revision_count == 2 and meta["destination"].last_changed_at == 1.2
     assert meta["origin"].revision_count == 1
     # the stale Delhi->Mumbai search result was purged when destination moved
-    assert all(f.startswith("GOA") for r in late["agent"].results.values()
-               for f in r.get("flights", []))
+    assert all(f.startswith("GOA") for c in late["agent"].done.values()
+               for f in c.result.get("flights", []))
 
     # a repair cue alone (no slot change) freezes the mutating call past the cue
     cue = {"name": "cue freeze", "multimodal": False, "faults": set(), "events": [
@@ -363,6 +396,40 @@ def _selfcheck():
     assert books[0]["t"] >= 3.0, "booking fired before the user confirmed"
     assert any(e["kind"] == FINAL and e.get("booked") for e in run["trace"]
                if e["dir"] == "out")
+
+    # -- transitive reads through derived arguments ---------------------------
+
+    # a call whose args come from another call's result inherits that call's
+    # reads, so one destination change invalidates the whole chain downstream
+    chain = simulate(SCENARIOS[6])
+    seat_calls = _out(chain, CALL, "check_seat_availability")
+    assert seat_calls and all(sc["reads"] == ["date", "destination", "origin"]
+                              for sc in seat_calls), \
+        "seat check must inherit the search's reads, not its visible slot names"
+    books = _out(chain, CALL, "book_flight")
+    assert len(books) == 1 and books[0]["args"]["flight_id"] == "GOA-101" \
+        and books[0]["args"]["seat"] == "GOA-101:12A", books
+    assert books[0]["reads"] == ["date", "destination", "origin", "pax"], \
+        "booking must carry both hops of inherited reads plus its own slot"
+    assert not chain["cancelled"], "chain died after completion; nothing to cancel"
+    # the MUM seat-check result died WITH the destination - two hops from the
+    # slot, with no result-specific special case in the coordinator
+    assert all(not c.result["flight_id"].startswith("MUM")
+               for c in chain["agent"].done.values()
+               if c.tool == "check_seat_availability")
+
+    # purge-as-consequence: an invalidated result no longer satisfies anything,
+    # so reverting to an earlier value re-runs the search instead of dead-ending
+    rev = {"name": "revert", "multimodal": False, "faults": set(), "events": [
+        (0.0, {"kind": "chunk", "text": "flight from Delhi to Mumbai tomorrow"}),
+        (1.5, {"kind": "interrupt", "text": "actually to Goa"}),
+        (3.0, {"kind": "interrupt", "text": "sorry, back to Mumbai"}),
+        (5.0, {"kind": "chunk", "text": "that's all", "final": True}),
+    ]}
+    run = simulate(rev)
+    mum_searches = [s for s in _out(run, CALL, "search_flights")
+                    if s["args"]["destination"] == "mumbai"]
+    assert len(mum_searches) == 2, "purged search must be re-runnable after a revert"
 
     # ticks are an optimisation, not a requirement: a replayed event stream
     # with no timer support must still complete every booking at full score

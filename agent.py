@@ -5,10 +5,12 @@ No asyncio in here. That makes every interruption path deterministically testabl
 and the adapter to the organisers' two-async-queue harness is ~20 lines (see README).
 
 The contribution is the Coordinator: dependency-tracked cancellation.
-Every in-flight call records WHICH SLOTS it was built from. When a slot changes
-mid-utterance we cancel exactly the calls whose inputs went stale and let the
-rest keep running. Cancel-everything loses task completion; cancel-nothing loses
-interruption recovery. This wins both.
+Every call records WHICH SLOTS it was built from - directly, or transitively
+when an argument is derived from another call's result (that call's reads are
+inherited). When a slot changes mid-utterance we invalidate exactly the work
+whose inputs went stale - cancelling it if running, forgetting it if finished -
+and let the rest keep running. Cancel-everything loses task completion;
+cancel-nothing loses interruption recovery. This wins both.
 """
 
 import hashlib
@@ -45,10 +47,13 @@ class Call:
     call_id: str
     tool: str
     args: dict
-    reads: frozenset      # slots this call's arguments were derived from
+    reads: frozenset      # slots this call's arguments were derived from,
+                          # including slots inherited through result-derived args
     mutating: bool
     idem_key: str | None
     issued_at: float
+    result: dict | None = None    # attached on completion; the call then lives
+                                  # on in Agent.done as a dependency-graph node
 
 
 def _idem(tool: str, args: dict) -> str:
@@ -115,11 +120,12 @@ class Agent:
         self.slots: dict = {}
         self.meta: dict[str, SlotMeta] = {}     # per-slot stability, updated in _apply
         self.inflight: dict[str, Call] = {}
-        self.committed: set[str] = set()        # idem keys already executed
-        self.completed: set[str] = set()        # (tool,args) signatures already satisfied
+        self.done: dict[str, Call] = {}         # completed calls, result attached.
+                                                # Single source of truth for results,
+                                                # their reads, and what's satisfied.
+        self.committed: set[str] = set()        # idem keys already executed - a record
+                                                # of world changes, never invalidated
         self.retries: dict[str, int] = {}
-        self.results: dict[str, dict] = {}
-        self.result_reads: dict[str, frozenset] = {}  # completed results are slot-dependent too
         self.blocked_duplicates = 0
         self.last_spoke = -99.0
         self.turn_closed = False
@@ -197,10 +203,9 @@ class Agent:
         call = self.inflight.pop(ev["call_id"], None)
         if call is None:
             return []                                   # result for a cancelled call: drop
-        self.results[call.call_id] = ev["result"]
-        self.result_reads[call.call_id] = call.reads    # results go stale like calls do
+        call.result = ev["result"]
+        self.done[call.call_id] = call                  # results go stale like calls do
         if ev["result"].get("ok"):
-            self.completed.add(_idem(call.tool, call.args))
             if call.mutating:
                 self.committed.add(call.idem_key)
         elif not call.mutating:
@@ -235,13 +240,15 @@ class Agent:
         return changed
 
     def _invalidate(self, changed: set, now: float) -> list[Action]:
+        """One dependency test for running and finished work alike: anything
+        whose reads intersect the change is stale. Running -> cancel. Finished
+        read-only -> forget, so no downstream call can build on it. A finished
+        MUTATION stays: it changed the world, and the record must survive."""
         if not changed:
             return []
-        # completed results derived from a moved slot are stale too - keeping
-        # them is how a re-plan books the OLD destination from the old search
-        for cid in [c for c, r in self.result_reads.items() if r & changed]:
-            del self.result_reads[cid]
-            self.results.pop(cid, None)
+        for cid, call in list(self.done.items()):
+            if not call.mutating and call.reads & changed:
+                del self.done[cid]
         acts = []
         for cid, call in list(self.inflight.items()):
             if call.reads & changed:
@@ -273,22 +280,45 @@ class Agent:
                                   "date": self.slots["date"]},
                                  {"origin", "destination", "date"}, now)
 
-        # A state-modifying call only fires once the user has committed, the search
-        # has landed, and the slots have held still. Speculating on a booking is how
-        # you double-book.
-        if self.slots.get("commit"):
-            flight = self._best_flight()
-            if flight:
-                reads = {"origin", "destination", "date", "pax"}
-                over = [s for s in sorted(reads)
-                        if (m := self.meta.get(s)) and m.revision_count > self.REVISION_CAP]
-                if over:
-                    acts += self._confirm(over[0], now)   # ask; don't wait longer
-                else:
-                    acts += self._ensure("book_flight",
-                                         {"flight_id": flight, "pax": self.slots.get("pax", 1)},
-                                         reads, now)
+        # Chain link 2: seats for the best flight. flight_id is derived from
+        # the search RESULT, so the call inherits the search's reads - a
+        # destination change invalidates it even though no slot name appears
+        # in its arguments.
+        search = self._latest("search_flights", "flights")
+        if search:
+            acts += self._ensure("check_seat_availability",
+                                 {"flight_id": search.result["flights"][0]},
+                                 set(search.reads), now)
+
+        # Chain link 3. A state-modifying call only fires once the user has
+        # committed, the chain has landed, and the slots have held still.
+        # Speculating on a booking is how you double-book. Its reads are the
+        # slots in its own args plus everything inherited through the chain.
+        seats = self._latest("check_seat_availability", "seats")
+        if self.slots.get("commit") and seats:
+            reads = {"pax"} | set(seats.reads)
+            over = [s for s in sorted(reads)
+                    if (m := self.meta.get(s)) and m.revision_count > self.REVISION_CAP]
+            if over:
+                acts += self._confirm(over[0], now)       # ask; don't wait longer
+            else:
+                acts += self._ensure("book_flight",
+                                     {"flight_id": seats.result["flight_id"],
+                                      "seat": seats.result["seats"][0],
+                                      "pax": self.slots.get("pax", 1)},
+                                     reads, now)
         return acts
+
+    def _latest(self, tool: str, field: str) -> Call | None:
+        """Most recent surviving completed call of `tool` whose result carries
+        `field`. Stale ones were already invalidated, so a survivor is safe to
+        derive arguments from - and its reads travel with it."""
+        best = None
+        for c in self.done.values():
+            if c.tool == tool and c.result.get("ok") and c.result.get(field):
+                if best is None or c.issued_at > best.issued_at:
+                    best = c
+        return best
 
     def _gate(self, reads: set) -> float:
         """Earliest time a mutating call over these slots may fire: a grace
@@ -323,8 +353,10 @@ class Agent:
         if key and key in self.committed:
             self.blocked_duplicates += 1
             return []                                    # <- the double-booking guard
-        if not mutating and _idem(tool, args) in self.completed:
-            return []                                    # already satisfied; don't re-fire
+        if not mutating and any(c.tool == tool and c.args == args and c.result.get("ok")
+                                for c in self.done.values()):
+            return []          # already satisfied by a LIVE result; a purged one
+                               # no longer satisfies anything, so re-runs are free
 
         if mutating:
             gate = self._gate(reads)
@@ -369,12 +401,6 @@ class Agent:
                                    "mutating": call.mutating, "idem_key": call.idem_key,
                                    "reads": sorted(call.reads), "retry_of": call.call_id})]
 
-    def _best_flight(self):
-        for r in self.results.values():
-            if r.get("ok") and r.get("flights"):
-                return r["flights"][0]
-        return None
-
     # -- turn end ----------------------------------------------------------
 
     def _finalise(self, now: float) -> list[Action]:
@@ -401,9 +427,10 @@ class Agent:
             return []                                    # still working; do not claim done
 
         self.turn_closed = False
-        booked = any(r.get("ok") and r.get("booking_ref") for r in self.results.values())
+        booked = any(c.result.get("ok") and c.result.get("booking_ref")
+                     for c in self.done.values())
         text = ("You're booked." if booked else
-                "Here's what I found." if self.results else
+                "Here's what I found." if self.done else
                 "I haven't got anything back yet.")
         return [Action(FINAL, now, {"text": text, "state": self.snapshot(),
                                     "booked": booked})]
