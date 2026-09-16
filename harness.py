@@ -105,6 +105,25 @@ SCENARIOS = [
                    "slots": {"origin": "delhi", "destination": "pune",
                              "date": "2026-09-15", "commit": True}},
     },
+    {
+        # The correction lands AFTER the commit keyword. A per-session chunk
+        # counter is satisfied by then; only per-slot dwell + a grace window
+        # can hold the booking back until the destination stops moving.
+        "name": "correction lands after the commit word",
+        "multimodal": False,
+        "faults": set(),
+        "events": [
+            (0.0, {"kind": "chunk", "text": "I need a flight from Delhi to Mumbai tomorrow"}),
+            (1.0, {"kind": "chunk", "text": "yes book it"}),
+            (1.2, {"kind": "interrupt", "text": "no wait, make that to Goa, sorry"}),
+            (2.5, {"kind": "chunk", "text": "that's all", "final": True}),
+        ],
+        "expect": {"tools_ok": {"search_flights", "book_flight"},
+                   "cancels": 0,
+                   "slots": {"origin": "delhi", "destination": "goa",
+                             "date": "2026-09-15", "commit": True},
+                   "never_called_with": [("book_flight", {"flight_id": "MUM-101"})]},
+    },
 ]
 
 SUBSTANTIVE = {SAY, CALL, CLARIFY, FINAL}
@@ -112,10 +131,13 @@ SUBSTANTIVE = {SAY, CALL, CLARIFY, FINAL}
 
 # --- simulator -------------------------------------------------------------
 
-def simulate(scn) -> dict:
+def simulate(scn, ticks=True) -> dict:
+    """ticks=False replays the stream with no timer support at all, the way a
+    fixed-replay eval kit would - correctness must not depend on ticks."""
     agent = Agent(MANIFEST)
     q, seq, trace = [], 0, []
     attempts, cancelled, mutating_keys = {}, set(), []
+    ticks_scheduled = set()
 
     for t, ev in scn["events"]:
         heapq.heappush(q, (t, seq, ev)); seq += 1
@@ -140,15 +162,24 @@ def simulate(scn) -> dict:
                 attempts[tool] = attempts.get(tool, 0) + 1
                 lat = MANIFEST[tool]["latency"]
                 res = run_tool(tool, args, attempts[tool], scn["faults"])
-                heapq.heappush(q, (now + lat, seq, {
+                # a call may be emitted ahead of its release time (a.t > now);
+                # the tool runs when the call is released, not when emitted
+                heapq.heappush(q, (a.t + lat, seq, {
                     "kind": "tool_result", "call_id": a.payload["call_id"],
                     "tool": tool, "args": args, "result": res})); seq += 1
             elif a.kind == CANCEL:
                 cancelled.add(a.payload["call_id"])
 
+        # the agent deferred a mutating call behind a grace window; deliver a
+        # tick when it expires (the real adapter maps this to a timer)
+        w = agent.next_wakeup()
+        if ticks and w is not None and w not in ticks_scheduled:
+            ticks_scheduled.add(w)
+            heapq.heappush(q, (w, seq, {"kind": "tick"})); seq += 1
+
     return {"trace": trace, "snapshot": agent.snapshot(),
             "cancelled": cancelled, "mutating_keys": mutating_keys,
-            "blocked_duplicates": agent.blocked_duplicates}
+            "blocked_duplicates": agent.blocked_duplicates, "agent": agent}
 
 
 # --- scorer (published rubric: 40 / 35 / 15 / 10) ---------------------------
@@ -156,7 +187,8 @@ def simulate(scn) -> dict:
 def score(scn, run) -> tuple[float, list[str]]:
     exp, trace, notes = scn["expect"], run["trace"], []
     outs = [e for e in trace if e["dir"] == "out"]
-    ins = [e for e in trace if e["dir"] == "in" and e["kind"] != "tool_result"]
+    # ticks are internal timers, not user inputs - no reply owed to them
+    ins = [e for e in trace if e["dir"] == "in" and e["kind"] not in ("tool_result", "tick")]
     ok_tools = {e["tool"] for e in trace
                 if e["dir"] == "in" and e["kind"] == "tool_result"
                 and e["result"].get("ok") and e["call_id"] not in run["cancelled"]}
@@ -188,6 +220,13 @@ def score(scn, run) -> tuple[float, list[str]]:
         notes.append(f"{len(stale)} stale results applied")
     else:
         ir += 15
+    # a mutating CALL issued with stale args is a violation even if later
+    # cancelled - the irreversible request already left the agent
+    for tool, must_not in exp.get("never_called_with", []):
+        bad = [o for o in outs if o["kind"] == CALL and o.get("tool") == tool
+               and all(o["args"].get(k) == v for k, v in must_not.items())]
+        if bad:
+            ir -= 15; notes.append(f"mutating call issued on stale slots: {tool} {must_not}")
     for tool, must_not in exp.get("no_stale_args", []):
         bad = [e for e in trace if e["dir"] == "in" and e["kind"] == "tool_result"
                and e["tool"] == tool and e["call_id"] not in run["cancelled"]
@@ -248,7 +287,8 @@ def main(quiet=False):
         if not quiet:
             for e in run["trace"]:
                 if e["dir"] == "in":
-                    d = e.get("text") or e.get("caption") or f"{e.get('tool')} {e.get('result','')}"
+                    d = e.get("text") or e.get("caption") or \
+                        (f"{e['tool']} {e['result']}" if e["kind"] == "tool_result" else "")
                     print(f"            {e['t']:5.1f} <- {e['kind']:12} {d}")
                 else:
                     d = e.get("text") or f"{e.get('tool', e.get('reason',''))} {e.get('args', e.get('invalidated_by',''))}"
@@ -270,6 +310,67 @@ def _selfcheck():
     dup = simulate(SCENARIOS[1])
     assert dup["blocked_duplicates"] >= 1, "duplicate booking was not blocked"
     assert len(dup["mutating_keys"]) == len(set(dup["mutating_keys"]))
+
+    # -- stability engine ---------------------------------------------------
+
+    def _out(run, kind, tool=None):
+        return [e for e in run["trace"] if e["dir"] == "out" and e["kind"] == kind
+                and (tool is None or e.get("tool") == tool)]
+
+    # correction after the commit word: the grace window must swallow the stale
+    # booking entirely - no MUM call, no cancel, only the corrected booking
+    late = simulate(SCENARIOS[5])
+    books = _out(late, CALL, "book_flight")
+    assert books, "corrected booking never fired"
+    assert all(b["args"]["flight_id"].startswith("GOA") for b in books), books
+    assert not late["cancelled"], "engine should defer the booking, not cancel it"
+    assert books[0]["t"] >= 1.2 + Agent.GRACE, f"booking fired inside the grace window: {books[0]['t']}"
+    # SlotMeta is per slot: destination carries the revision, origin does not
+    meta = late["agent"].meta
+    assert meta["destination"].revision_count == 2 and meta["destination"].last_changed_at == 1.2
+    assert meta["origin"].revision_count == 1
+    # the stale Delhi->Mumbai search result was purged when destination moved
+    assert all(f.startswith("GOA") for r in late["agent"].results.values()
+               for f in r.get("flights", []))
+
+    # a repair cue alone (no slot change) freezes the mutating call past the cue
+    cue = {"name": "cue freeze", "multimodal": False, "faults": set(), "events": [
+        (0.0, {"kind": "chunk", "text": "flight from Delhi to Mumbai tomorrow"}),
+        (2.0, {"kind": "chunk", "text": "book it"}),
+        (2.2, {"kind": "interrupt", "text": "wait"}),
+        (4.0, {"kind": "chunk", "text": "that's all", "final": True}),
+    ]}
+    run = simulate(cue)
+    books = _out(run, CALL, "book_flight")
+    assert len(books) == 1, books
+    assert books[0]["t"] >= 2.2 + Agent.GRACE, \
+        f"repair cue did not freeze the booking: fired at {books[0]['t']}"
+
+    # past the revision cap: clarify instead of a longer wait; the user's answer
+    # de-escalates and the booking then fires on the confirmed value
+    esc = {"name": "over-revised", "multimodal": False, "faults": set(), "events": [
+        (0.0, {"kind": "chunk", "text": "flight from Delhi to Mumbai tomorrow"}),
+        (0.5, {"kind": "interrupt", "text": "no to Goa"}),
+        (1.0, {"kind": "interrupt", "text": "actually to Pune"}),
+        (2.5, {"kind": "chunk", "text": "book it", "final": True}),
+        (3.0, {"kind": "chunk", "text": "to Pune", "final": True}),
+    ]}
+    run = simulate(esc)
+    clar = [c for c in _out(run, CLARIFY) if "confirm" in c]
+    assert clar and "destination" in clar[0]["confirm"], clar
+    books = _out(run, CALL, "book_flight")
+    assert len(books) == 1 and books[0]["args"]["flight_id"] == "PUN-101", books
+    assert books[0]["t"] >= 3.0, "booking fired before the user confirmed"
+    assert any(e["kind"] == FINAL and e.get("booked") for e in run["trace"]
+               if e["dir"] == "out")
+
+    # ticks are an optimisation, not a requirement: a replayed event stream
+    # with no timer support must still complete every booking at full score
+    for scn in SCENARIOS:
+        no_tick = simulate(scn, ticks=False)
+        pts, why = score(scn, no_tick)
+        assert pts == 100.0, f"no-tick replay: {scn['name']} scored {pts}: {why}"
+
     print("selfcheck ok")
 
 

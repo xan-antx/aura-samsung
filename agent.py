@@ -32,6 +32,15 @@ class Action:
 
 
 @dataclass
+class SlotMeta:
+    """Per-slot stability record. Dwell is measured from last_changed_at, not
+    from a session-wide chunk count - a slot written 100ms ago is not stable
+    no matter how many chunks the session has seen."""
+    last_changed_at: float
+    revision_count: int = 1
+
+
+@dataclass
 class Call:
     call_id: str
     tool: str
@@ -82,24 +91,43 @@ def _extract(text: str) -> dict:
     return out
 
 
+REPAIR_CUES = {"actually", "wait", "sorry", "no"}
+
+
+def _repair_cue(text: str) -> bool:
+    """Disfluency on the transcript tail: a correction is probably coming."""
+    tail = [w.strip(".,!?-") for w in text.lower().split()][-8:]
+    return bool(REPAIR_CUES & set(tail)) or "make that" in " ".join(tail)
+
+
 # --- the agent ------------------------------------------------------------
 
 class Agent:
     FILLER_GAP = 2.0       # don't emit a second filler within this many seconds
-    STABILITY = 2          # slot must survive this many chunks before a mutating call
+    GRACE = 0.4            # dwell before an irreversible call; only the call waits,
+                           # the fast path keeps speaking, so latency-to-speech is 0
+    ESCALATED = 0.8        # one escalation step after a correction. Never more:
+                           # exponential dwell starves the least certain users
+    REVISION_CAP = 2       # revisions beyond this route to Clarify, not longer waits
 
     def __init__(self, manifest: dict):
         self.manifest = manifest                # tool_name -> {"mutating": bool, "reads": [...]}
         self.slots: dict = {}
+        self.meta: dict[str, SlotMeta] = {}     # per-slot stability, updated in _apply
         self.inflight: dict[str, Call] = {}
         self.committed: set[str] = set()        # idem keys already executed
         self.completed: set[str] = set()        # (tool,args) signatures already satisfied
         self.retries: dict[str, int] = {}
         self.results: dict[str, dict] = {}
+        self.result_reads: dict[str, frozenset] = {}  # completed results are slot-dependent too
         self.blocked_duplicates = 0
         self.last_spoke = -99.0
         self.turn_closed = False
-        self.chunks_seen = 0
+        self.commit_at = -1e9                   # last time the user said a commit word
+        self.repair_cue_at = -1e9               # last "wait/actually/sorry/no/make that"
+        self.wake_at: float | None = None       # deferred mutating call may fire here
+        self.deferred: tuple | None = None      # (tool, args, reads, key, gate) held back
+        self.pending_confirm: str | None = None # slot past the revision cap, awaiting answer
         self.pending_perception = 0
         self._n = 0
 
@@ -107,15 +135,29 @@ class Agent:
 
     def handle(self, ev: dict, now: float) -> list[Action]:
         kind = ev["kind"]
+        # Flush first: a deferred call whose grace window has elapsed fires on
+        # ANY event. Ticks are an optimisation (they release the call as early
+        # as possible); a replayed stream with no timers is still correct.
+        acts: list[Action] = []
+        if self.wake_at is not None and now >= self.wake_at:
+            acts += self._plan(now)
+            if self.turn_closed:
+                acts += self._finalise(now)
         if kind == "chunk":
-            return self._on_chunk(ev, now)
+            return acts + self._on_chunk(ev, now)
         if kind in ("audio", "frame"):
-            return self._on_perception(ev, now)
+            return acts + self._on_perception(ev, now)
         if kind == "interrupt":
-            return self._on_chunk({**ev, "final": False}, now)
+            return acts + self._on_chunk({**ev, "final": False}, now)
         if kind == "tool_result":
-            return self._on_result(ev, now)
-        return []
+            return acts + self._on_result(ev, now)
+        return acts                     # "tick": the flush above was its whole job
+
+    def next_wakeup(self) -> float | None:
+        """Optional adapter hint: if set, delivering a {"kind": "tick"} event at
+        this time releases a deferred call promptly. Purely an optimisation -
+        any later event flushes it, and end-of-turn emits it self-scheduled."""
+        return self.wake_at
 
     def snapshot(self) -> dict:
         return {"intent": self.slots.get("intent"),
@@ -124,8 +166,10 @@ class Agent:
     # -- event handlers ----------------------------------------------------
 
     def _on_chunk(self, ev, now) -> list[Action]:
-        self.chunks_seen += 1
-        changed = self._apply(_extract(ev["text"]))
+        text = ev.get("text", "")
+        if _repair_cue(text):
+            self.repair_cue_at = now               # freeze mutations: correction incoming
+        changed = self._apply(_extract(text), now)
         acts = self._invalidate(changed, now)          # cancel stale work FIRST
         acts += self._plan(now)
         if ev.get("final"):
@@ -143,7 +187,7 @@ class Agent:
         if now - self.last_spoke > self.FILLER_GAP:
             acts.append(self._say("Let me take a look at that.", now))
         self.pending_perception += 1
-        changed = self._apply(_extract(ev.get("caption", "")))
+        changed = self._apply(_extract(ev.get("caption", "")), now)
         acts += self._invalidate(changed, now)
         acts += self._plan(now)
         self.pending_perception -= 1
@@ -154,6 +198,7 @@ class Agent:
         if call is None:
             return []                                   # result for a cancelled call: drop
         self.results[call.call_id] = ev["result"]
+        self.result_reads[call.call_id] = call.reads    # results go stale like calls do
         if ev["result"].get("ok"):
             self.completed.add(_idem(call.tool, call.args))
             if call.mutating:
@@ -167,18 +212,36 @@ class Agent:
 
     # -- coordination ------------------------------------------------------
 
-    def _apply(self, extracted: dict) -> set:
+    def _apply(self, extracted: dict, now: float) -> set:
         """Localised slot correction. Returns the set of slots whose value moved."""
         changed = set()
         for k, v in extracted.items():
             if self.slots.get(k) != v:
                 self.slots[k] = v
                 changed.add(k)
+                m = self.meta.get(k)
+                if m is None:
+                    self.meta[k] = SlotMeta(last_changed_at=now)
+                else:
+                    m.last_changed_at = now
+                    m.revision_count += 1
+            if k == self.pending_confirm:
+                # any answer naming the slot resolves the clarify - a repeat
+                # confirms, a new value IS the answer. Either way, de-escalate.
+                self.meta[k].revision_count = 1
+                self.pending_confirm = None
+        if extracted.get("commit"):
+            self.commit_at = now        # every "book it" restarts the grace clock
         return changed
 
     def _invalidate(self, changed: set, now: float) -> list[Action]:
         if not changed:
             return []
+        # completed results derived from a moved slot are stale too - keeping
+        # them is how a re-plan books the OLD destination from the old search
+        for cid in [c for c, r in self.result_reads.items() if r & changed]:
+            del self.result_reads[cid]
+            self.results.pop(cid, None)
         acts = []
         for cid, call in list(self.inflight.items()):
             if call.reads & changed:
@@ -198,6 +261,7 @@ class Agent:
 
     def _plan(self, now: float) -> list[Action]:
         acts: list[Action] = []
+        self.wake_at = self.deferred = None    # recomputed below if still deferring
         if self.slots.get("intent") != "flight":
             return acts
 
@@ -212,13 +276,41 @@ class Agent:
         # A state-modifying call only fires once the user has committed, the search
         # has landed, and the slots have held still. Speculating on a booking is how
         # you double-book.
-        if self.slots.get("commit") and self.chunks_seen >= self.STABILITY:
+        if self.slots.get("commit"):
             flight = self._best_flight()
             if flight:
-                acts += self._ensure("book_flight",
-                                     {"flight_id": flight, "pax": self.slots.get("pax", 1)},
-                                     {"origin", "destination", "date", "pax"}, now)
+                reads = {"origin", "destination", "date", "pax"}
+                over = [s for s in sorted(reads)
+                        if (m := self.meta.get(s)) and m.revision_count > self.REVISION_CAP]
+                if over:
+                    acts += self._confirm(over[0], now)   # ask; don't wait longer
+                else:
+                    acts += self._ensure("book_flight",
+                                         {"flight_id": flight, "pax": self.slots.get("pax", 1)},
+                                         reads, now)
         return acts
+
+    def _gate(self, reads: set) -> float:
+        """Earliest time a mutating call over these slots may fire: a grace
+        window after the commit word, the last repair cue, and each read slot's
+        last change. One doubled step for a corrected slot, then the cap."""
+        gate = max(self.commit_at, self.repair_cue_at) + self.GRACE
+        for s in reads:
+            m = self.meta.get(s)
+            if m is not None:
+                dwell = self.ESCALATED if m.revision_count >= 2 else self.GRACE
+                gate = max(gate, m.last_changed_at + dwell)
+        return gate
+
+    def _confirm(self, slot: str, now: float) -> list[Action]:
+        """Past the escalation cap the user is telling us they're not sure.
+        A longer dwell would punish exactly them - clarify instead."""
+        if self.pending_confirm:
+            return []                                    # already on the floor
+        self.pending_confirm = slot
+        return [Action(CLARIFY, now, {
+            "text": f"Just to confirm - {slot} is {self.slots[slot]}, correct?",
+            "confirm": {slot: self.slots[slot]}, "state": self.snapshot()})]
 
     def _ensure(self, tool: str, args: dict, reads: set, now: float) -> list[Action]:
         """Issue a call unless it is already running or already committed."""
@@ -234,17 +326,31 @@ class Agent:
         if not mutating and _idem(tool, args) in self.completed:
             return []                                    # already satisfied; don't re-fire
 
-        self._n += 1
-        cid = f"c{self._n}"
-        self.inflight[cid] = Call(cid, tool, args, frozenset(reads), mutating, key, now)
+        if mutating:
+            gate = self._gate(reads)
+            if now < gate:
+                # Grace window. The fast path has already spoken; only the
+                # irreversible call waits, so time-to-first-speech is untouched.
+                self.wake_at = gate if self.wake_at is None else min(self.wake_at, gate)
+                self.deferred = (tool, args, reads, key, gate)
+                return []
 
-        acts = [Action(CALL, now, {"call_id": cid, "tool": tool, "args": args,
-                                   "mutating": mutating, "idem_key": key,
-                                   "reads": sorted(reads)})]
+        acts = self._issue(tool, args, reads, mutating, key, now)
         if now - self.last_spoke > self.FILLER_GAP:
             # Progress narration only. Never a completion claim - we have no result yet.
             acts.append(self._say("One moment, checking that now.", now))
         return acts
+
+    def _issue(self, tool, args, reads, mutating, key, t: float) -> list[Action]:
+        """Register the call and emit it stamped at t. t may be in the future:
+        the adapter releases it when the clock gets there, and a cancel emitted
+        before then retracts it unsent."""
+        self._n += 1
+        cid = f"c{self._n}"
+        self.inflight[cid] = Call(cid, tool, args, frozenset(reads), mutating, key, t)
+        return [Action(CALL, t, {"call_id": cid, "tool": tool, "args": args,
+                                 "mutating": mutating, "idem_key": key,
+                                 "reads": sorted(reads)})]
 
     MAX_RETRIES = 1
 
@@ -277,6 +383,18 @@ class Agent:
             return [Action(CLARIFY, now, {
                 "text": f"Which {sorted(missing)[0]} should I use?",
                 "missing": sorted(missing), "state": self.snapshot()})]
+
+        if self.pending_confirm:
+            return []                                    # a clarify is already on the floor
+
+        if self.deferred is not None:
+            # End of turn with a call still inside its grace window and no
+            # guarantee of further events (or ticks). Emit it now, stamped at
+            # its gate time - it fires when the clock elapses, tick or no tick.
+            tool, args, reads, key, gate = self.deferred
+            self.wake_at = self.deferred = None
+            self.turn_closed = True
+            return self._issue(tool, args, reads, True, key, gate)
 
         if self.inflight:
             self.turn_closed = True
