@@ -22,8 +22,18 @@ Every call here records **which slots its arguments were derived from**:
 Call(tool="search_flights", reads=frozenset({"origin", "destination", "date"}))
 ```
 
-When a slot moves, we cancel exactly the calls whose `reads` intersect the change
-and let the rest run. That's the whole trick, and it's why the same design wins
+An argument derived from another call's *result* inherits that call's `reads`,
+so the dependency survives any number of hops — the seat check carries the
+search's slots, and the booking carries both:
+
+```python
+Call(tool="check_seat_availability",   # args hold no slot at all,
+     reads=frozenset({"origin", "destination", "date"}))   # yet it reads these
+```
+
+When a slot moves, we invalidate exactly the work whose `reads` intersect the
+change — cancelling it if running, forgetting it if finished — and let the rest
+run. That's the whole trick, and it's why the same design wins
 both Task Completion (40%) and Interruption Recovery (35%) instead of trading one
 for the other.
 
@@ -47,6 +57,15 @@ reproducible, which is why the whole suite runs instantly with no flaky timing.
 `harness.py` is a discrete-event simulator over `heapq` — virtual clock, no real
 sleeping, identical trace every run.
 
+Completed calls are first-class dependency nodes: a finished call keeps its
+`Call` record, result attached, in a single `done` map. That map is the only
+source of truth for results, their `reads`, and what counts as already
+satisfied. Invalidation is one uniform test — `call.reads & changed` — applied
+to in-flight calls (cancel) and completed calls (forget) alike, so the stale
+chain downstream of a changed slot dies in a single pass. A completed
+**mutation** is exempt: forgetting a booking that already happened can't
+un-book it, and would reopen the double-charge path.
+
 ## Swapping in the organisers' kit
 
 The eval kit arrives after registration. `agent.py` should not need to change;
@@ -60,6 +79,16 @@ async def adapter(inbox, outbox, manifest):
         for action in agent.handle(ev, ev["t"]):
             await outbox.put(json.loads(action.as_json()))
 ```
+
+Adapter assumption: `t` on a `call` action is a release time, not an emission
+timestamp. If the host executes calls on dequeue, deferred mutating calls must
+be held by the adapter until `t` elapses, and a `cancel` arriving before then
+retracts them unsent.
+
+`Agent.next_wakeup()` is an optional hint: delivering a `{"kind": "tick"}`
+event at that time releases a deferred call promptly. It is purely an
+optimisation — any later event flushes the deferral, so a fixed replayed
+stream with no timer support is still correct (`--selfcheck` asserts this).
 
 Then replace `MANIFEST`, `run_tool` and `SCENARIOS` in `harness.py` with theirs
 and delete the local scorer in favour of the real one.
@@ -77,8 +106,5 @@ and delete the local scorer in favour of the real one.
 
 ## Not built yet
 
-- Chained tool calls where call B's arguments depend on call A's result. The
-  `reads` mechanism extends to it (add result-derived slots to `reads`) but it
-  isn't wired.
 - Unseen tools from a runtime manifest — `MANIFEST` is currently a module constant.
 - The quality multiplier (0.80×–1.20×) is not modelled.

@@ -8,9 +8,10 @@ Submission 25 Sep 2026. Release tag on final commit: `PRISM_GENAI_HACKATHON_Y202
 A full-duplex voice agent that survives mid-sentence corrections.
 
 Core idea: every tool call records `reads` — the set of slots its arguments were
-derived from. When a slot changes, cancel exactly the calls whose `reads`
-intersect the change. Everything else keeps running. No rollback, so unrelated
-slots are never lost.
+derived from, directly or inherited through another call's result. When a slot
+changes, invalidate exactly the work whose `reads` intersect the change —
+cancel it if running, forget it if finished. Everything else keeps running.
+No rollback, so unrelated slots are never lost.
 
 Read `README.md` before changing anything.
 
@@ -67,14 +68,16 @@ The UI and the scorer consume the action stream. Neither reads `agent.py`.
 
 ## Known placeholders
 
-- `Agent.STABILITY` counts chunks per session, not per slot. **Wrong.** Replace
-  with `SlotMeta(last_changed_at, revision_count)` + repair-cue detection +
-  grace-window deferral. Escalation caps at one step, then routes to Clarify —
-  do not scale dwell exponentially, it starves the least certain users.
 - `_extract` is a keyword matcher. Swap for an LLM call, same return type.
-- Chained calls (call B's args depend on call A's result) are not wired.
 - The scorer implements the published rubric from our reading of the spec. It is
   not Samsung's scorer. Scoring 100 means the agent behaves as designed, nothing more.
+
+(Formerly listed here, now implemented: per-slot stability is
+`SlotMeta(last_changed_at, revision_count)` with repair cues, grace-window
+deferral, and escalation capped at one step before routing to Clarify — never
+scale dwell exponentially, it starves the least certain users. Chained calls
+are wired via transitive `reads`: a call built from another call's result
+inherits that call's `reads`.)
 
 ## Do not
 
