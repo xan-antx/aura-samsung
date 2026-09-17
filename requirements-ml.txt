@@ -1,0 +1,5 @@
+# Optional ML dependencies for Project Aura (ml-perception)
+# Core coordinator (agent.py) and simulator (harness.py) run on pure stdlib.
+# Install these only if local ASR/Whisper or local VLM is desired.
+
+faster-whisper>=1.0.0
