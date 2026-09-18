@@ -1,0 +1,5 @@
+services:
+  visualizer:
+    build: ./ui
+    ports:
+      - "4173:4173"
