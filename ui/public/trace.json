@@ -1,0 +1,39 @@
+{
+  "trace": [
+    {
+      "dir": "in",
+      "t": 0,
+      "kind": "chunk",
+      "text": "I want a flight to Delhi"
+    },
+    {
+      "dir": "out",
+      "t": 0.5,
+      "kind": "call",
+      "tool": "search_flights",
+      "call_id": "call_1"
+    },
+    {
+      "dir": "in",
+      "t": 1.2,
+      "kind": "interrupt",
+      "text": "Wait, go to Goa instead"
+    },
+    {
+      "dir": "out",
+      "t": 1.2,
+      "kind": "cancel",
+      "call_id": "call_1",
+      "invalidated_by": [
+        "destination"
+      ]
+    },
+    {
+      "dir": "out",
+      "t": 1.5,
+      "kind": "call",
+      "tool": "search_flights",
+      "call_id": "call_2"
+    }
+  ]
+}
