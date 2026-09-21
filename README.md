@@ -6,9 +6,23 @@ Dependency-tracked cancellation for full-duplex agents. Pure stdlib, Python 3.10
 python harness.py              # all scenarios, full traces, rubric score
 python harness.py -q           # scores only
 python harness.py --selfcheck  # asserts the coordinator invariants
+python harness.py --telemetry  # per-scenario latency/cancels/tokens -> telemetry.csv
 ```
 
 No install step, no dependencies, no network. That satisfies the reproducibility gate on its own.
+
+Or containerised, with the trace visualiser:
+
+```bash
+docker compose up --build
+```
+
+The `harness` service (stock `python:3.12-slim`, no pip install) runs
+`--selfcheck` and then the full scored suite — both stream into the compose
+logs — and writes the flagship scenario's trace to `ui/public/trace.json`.
+The visualiser starts only after that run completes and serves it at
+http://localhost:4173, so the timeline on screen is the run that just
+happened on your machine, not a committed snapshot.
 
 ## The idea
 

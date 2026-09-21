@@ -1,5 +1,36 @@
 services:
+  # Reproducibility gate: runs the invariant selfcheck, then the full scored
+  # replay suite, on a clean machine with no manual step. agent.py and
+  # harness.py are pure stdlib, so the stock python image needs no pip install.
+  # Finally writes the flagship scenario's trace where the visualiser serves
+  # it, so the UI shows THIS run, not a committed snapshot.
+  harness:
+    image: python:3.12-slim
+    working_dir: /app
+    environment:
+      PYTHONUNBUFFERED: "1"        # scores stream into `docker compose up` logs
+      PYTHONDONTWRITEBYTECODE: "1"
+    volumes:
+      - .:/app
+    # exec form + python -c: no shell anywhere, so no sh/bash chaining quirks.
+    # check=True makes any failing step exit non-zero, which keeps the
+    # visualizer's depends_on gate honest.
+    command:
+      - python
+      - -c
+      - |
+        import subprocess, sys
+        for args in (["--selfcheck"], [], ["--export-trace", "ui/public/trace.json"]):
+            subprocess.run([sys.executable, "harness.py", *args], check=True)
+
   visualizer:
     build: ./ui
     ports:
       - "4173:4173"
+    depends_on:
+      harness:
+        condition: service_completed_successfully
+    volumes:
+      # the image bakes public/ into dist/ at build time; overlaying just this
+      # file makes the served trace the one the harness service just wrote
+      - ./ui/public/trace.json:/app/dist/trace.json

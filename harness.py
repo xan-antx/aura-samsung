@@ -7,6 +7,7 @@ when it lands; agent.py does not change.
     python harness.py            # run all scenarios, print traces + score
     python harness.py -q         # score only
     python harness.py --telemetry   # per-scenario latency/cancels/tokens -> telemetry.csv
+    python harness.py --export-trace PATH   # flagship scenario's trace for the visualiser
 """
 
 import heapq
@@ -379,6 +380,21 @@ def score(scn, run) -> tuple[float, list[str]]:
         if o["kind"] == SAY and any(w in o.get("text", "").lower()
                                     for w in ("booked", "done", "confirmed")):
             sf -= 5; notes.append("false completion claim on the fast path")
+    # A completion claim must not hide an earlier, still-live mutation. From
+    # the stream alone, "superseded" means: a successful mutating result that
+    # is not the most recent one at FINAL time - the claim is about the latest
+    # state, so every older live booking must be named in the spoken text.
+    live = [e for e in trace if e["dir"] == "in" and e["kind"] == "tool_result"
+            and e["result"].get("ok") and e["result"].get("booking_ref")
+            and e["call_id"] not in run["cancelled"]]
+    for o in outs:
+        if o["kind"] == FINAL and o.get("booked"):
+            prior = [e for e in live if e["t"] <= o["t"]]
+            for e in prior[:-1]:
+                fid = e["args"].get("flight_id", "")
+                if fid and fid not in o.get("text", ""):
+                    sf -= 5
+                    notes.append(f"completion claimed while earlier live booking {fid} is undisclosed")
 
     total = max(0.0, min(100.0, tc + ir + lat + sf))
     if scn["multimodal"]:
@@ -448,7 +464,17 @@ def telemetry_table(write_csv=True) -> list[dict]:
     return rows
 
 
+def export_trace(path):
+    """Write the flagship scenario's trace in the shape the visualiser fetches
+    ({"trace": [...]}). The sim is deterministic, so a judge's run produces the
+    same trace every time - the UI then shows their run, not a committed file."""
+    run = simulate(SCENARIOS[0])
+    with open(path, "w") as f:
+        json.dump({"scenario": SCENARIOS[0]["name"], "trace": run["trace"]}, f, indent=2)
+    print(f"wrote {path} ({SCENARIOS[0]['name']})")
 
+
+def main(quiet=False):
     totals = []
     for scn in SCENARIOS:
         run = simulate(scn)
@@ -572,6 +598,23 @@ def _selfcheck():
                     if s["args"]["destination"] == "mumbai"]
     assert len(mum_searches) == 2, "purged search must be re-runnable after a revert"
 
+    # a superseded completed mutation is disclosed, never forgotten: after the
+    # post-final correction, the Goa final names the still-live Mumbai booking
+    twice = simulate(SCENARIOS[8])
+    finals = _out(twice, FINAL)
+    assert len(finals) == 2 and finals[0]["booked"] and finals[1]["booked"]
+    assert "superseded" not in finals[0], "nothing to disclose at the first final"
+    assert "MUM-101" in finals[1]["text"], finals[1]["text"]
+    assert [b["flight_id"] for b in finals[1]["superseded"]] == ["MUM-101"]
+    # and the record itself survives in done - the ledger and the disclosure agree
+    assert any(c.mutating and c.superseded and c.args["flight_id"] == "MUM-101"
+               and c.result["booking_ref"] for c in twice["agent"].done.values())
+
+    # the exported trace is JSON-clean and in the exact shape the visualiser
+    # fetches: {"trace": [...]} with every entry serialisable as-is
+    payload = json.loads(json.dumps({"trace": simulate(SCENARIOS[0])["trace"]}))
+    assert payload["trace"] and all("t" in e and "kind" in e for e in payload["trace"])
+
     # ticks are an optimisation, not a requirement: a replayed event stream
     # with no timer support must still complete every booking at full score
     for scn in SCENARIOS:
@@ -611,5 +654,7 @@ if __name__ == "__main__":
         _selfcheck()
     elif "--telemetry" in sys.argv:
         telemetry_table()
+    elif "--export-trace" in sys.argv:
+        export_trace(sys.argv[sys.argv.index("--export-trace") + 1])
     else:
         main(quiet="-q" in sys.argv)

@@ -54,6 +54,9 @@ class Call:
     issued_at: float
     result: dict | None = None    # attached on completion; the call then lives
                                   # on in Agent.done as a dependency-graph node
+    superseded: bool = False      # completed mutation whose reads later went
+                                  # stale: can't be undone by forgetting, so it
+                                  # is disclosed in the final response instead
 
 
 def _idem(tool: str, args: dict) -> str:
@@ -247,8 +250,14 @@ class Agent:
         if not changed:
             return []
         for cid, call in list(self.done.items()):
-            if not call.mutating and call.reads & changed:
-                del self.done[cid]
+            if call.reads & changed:
+                if not call.mutating:
+                    del self.done[cid]
+                elif call.result.get("ok"):
+                    # the world already changed; the record stays, but it now
+                    # describes something the user no longer asked for. Flag it
+                    # so _finalise names it - never silently hold two bookings.
+                    call.superseded = True
         acts = []
         for cid, call in list(self.inflight.items()):
             if call.reads & changed:
@@ -427,13 +436,24 @@ class Agent:
             return []                                    # still working; do not claim done
 
         self.turn_closed = False
-        booked = any(c.result.get("ok") and c.result.get("booking_ref")
-                     for c in self.done.values())
+        bookings = [c for c in self.done.values()
+                    if c.mutating and c.result.get("ok") and c.result.get("booking_ref")]
+        booked = any(not c.superseded for c in bookings)
         text = ("You're booked." if booked else
                 "Here's what I found." if self.done else
                 "I haven't got anything back yet.")
-        return [Action(FINAL, now, {"text": text, "state": self.snapshot(),
-                                    "booked": booked})]
+        payload = {"text": text, "state": self.snapshot(), "booked": booked}
+        stale = [c for c in bookings if c.superseded]
+        if stale:
+            # Truthfulness over tidiness: a superseded booking is still real.
+            # Name it and offer the fix; never let "You're booked" imply there
+            # is exactly one booking when there are two.
+            names = " and ".join(f"{c.args['flight_id']} (ref {c.result['booking_ref']})"
+                                 for c in stale)
+            payload["text"] += f" Your earlier booking {names} is still active - shall I cancel it?"
+            payload["superseded"] = [{"flight_id": c.args["flight_id"],
+                                      "booking_ref": c.result["booking_ref"]} for c in stale]
+        return [Action(FINAL, now, payload)]
 
     def _say(self, text: str, now: float) -> Action:
         self.last_spoke = now

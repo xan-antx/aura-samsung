@@ -1,0 +1,11 @@
+name,mean_latency_s,max_latency_s,cancels,token_cost_proxy
+mid-utterance destination change,0.133,0.4,1,20
+duplicate booking guard,0.133,0.4,0,16
+"missing slot -> clarify, never guess",0.0,0.0,0,7
+read-only retry after injected fault,0.0,0.0,0,8
+multimodal: frame grounding behind an acknowledgment,0.4,0.8,0,13
+correction lands after the commit word,0.288,0.95,0,21
+derived args: seat from a superseded flight,0.112,0.25,0,14
+interrupt lands at the exact instant a tool returns,0.133,0.4,1,12
+correction arrives after the final marker,0.133,0.4,0,12
+rapid double correction escalates to a confirm,0.0,0.0,2,14

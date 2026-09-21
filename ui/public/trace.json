@@ -1,39 +1,192 @@
 {
+  "scenario": "mid-utterance destination change",
   "trace": [
     {
       "dir": "in",
-      "t": 0,
+      "t": 0.0,
       "kind": "chunk",
-      "text": "I want a flight to Delhi"
+      "text": "I need a flight from Delhi to Mumbai tomorrow"
     },
     {
       "dir": "out",
-      "t": 0.5,
+      "args": {
+        "date": "2026-09-15",
+        "destination": "mumbai",
+        "origin": "delhi"
+      },
+      "call_id": "c1",
+      "idem_key": null,
       "kind": "call",
-      "tool": "search_flights",
-      "call_id": "call_1"
+      "mutating": false,
+      "reads": [
+        "date",
+        "destination",
+        "origin"
+      ],
+      "t": 0.0,
+      "tool": "search_flights"
+    },
+    {
+      "dir": "out",
+      "kind": "say",
+      "t": 0.0,
+      "text": "One moment, checking that now."
     },
     {
       "dir": "in",
-      "t": 1.2,
+      "t": 0.6,
       "kind": "interrupt",
-      "text": "Wait, go to Goa instead"
+      "text": "sorry, change that to Goa"
     },
     {
       "dir": "out",
-      "t": 1.2,
-      "kind": "cancel",
-      "call_id": "call_1",
+      "call_id": "c1",
       "invalidated_by": [
         "destination"
-      ]
+      ],
+      "kind": "cancel",
+      "reason": "superseded",
+      "t": 0.6
     },
     {
       "dir": "out",
-      "t": 1.5,
+      "kind": "say",
+      "supersedes_speech": true,
+      "t": 0.6,
+      "text": "Got it, updating that."
+    },
+    {
+      "dir": "out",
+      "args": {
+        "date": "2026-09-15",
+        "destination": "goa",
+        "origin": "delhi"
+      },
+      "call_id": "c2",
+      "idem_key": null,
       "kind": "call",
+      "mutating": false,
+      "reads": [
+        "date",
+        "destination",
+        "origin"
+      ],
+      "t": 0.6,
+      "tool": "search_flights"
+    },
+    {
+      "dir": "in",
+      "t": 1.5,
+      "kind": "tool_result",
+      "call_id": "c2",
       "tool": "search_flights",
-      "call_id": "call_2"
+      "args": {
+        "origin": "delhi",
+        "destination": "goa",
+        "date": "2026-09-15"
+      },
+      "result": {
+        "ok": true,
+        "flights": [
+          "GOA-101",
+          "GOA-204"
+        ]
+      }
+    },
+    {
+      "dir": "out",
+      "args": {
+        "flight_id": "GOA-101"
+      },
+      "call_id": "c3",
+      "idem_key": null,
+      "kind": "call",
+      "mutating": false,
+      "reads": [
+        "date",
+        "destination",
+        "origin"
+      ],
+      "t": 1.5,
+      "tool": "check_seat_availability"
+    },
+    {
+      "dir": "in",
+      "t": 1.75,
+      "kind": "tool_result",
+      "call_id": "c3",
+      "tool": "check_seat_availability",
+      "args": {
+        "flight_id": "GOA-101"
+      },
+      "result": {
+        "ok": true,
+        "flight_id": "GOA-101",
+        "seats": [
+          "GOA-101:12A",
+          "GOA-101:14C"
+        ]
+      }
+    },
+    {
+      "dir": "in",
+      "t": 2.4,
+      "kind": "chunk",
+      "text": "yes book it for two passengers",
+      "final": true
+    },
+    {
+      "dir": "out",
+      "args": {
+        "flight_id": "GOA-101",
+        "pax": 2,
+        "seat": "GOA-101:12A"
+      },
+      "call_id": "c4",
+      "idem_key": "6ea45d3e43a055b8",
+      "kind": "call",
+      "mutating": true,
+      "reads": [
+        "date",
+        "destination",
+        "origin",
+        "pax"
+      ],
+      "t": 2.8,
+      "tool": "book_flight"
+    },
+    {
+      "dir": "in",
+      "t": 3.9,
+      "kind": "tool_result",
+      "call_id": "c4",
+      "tool": "book_flight",
+      "args": {
+        "flight_id": "GOA-101",
+        "seat": "GOA-101:12A",
+        "pax": 2
+      },
+      "result": {
+        "ok": true,
+        "booking_ref": "PNR0846"
+      }
+    },
+    {
+      "dir": "out",
+      "booked": true,
+      "kind": "final",
+      "state": {
+        "intent": "flight",
+        "slots": {
+          "commit": true,
+          "date": "2026-09-15",
+          "destination": "goa",
+          "origin": "delhi",
+          "pax": 2
+        }
+      },
+      "t": 3.9,
+      "text": "You're booked."
     }
   ]
 }
