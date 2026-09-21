@@ -6,6 +6,7 @@ when it lands; agent.py does not change.
 
     python harness.py            # run all scenarios, print traces + score
     python harness.py -q         # score only
+    python harness.py --telemetry   # per-scenario latency/cancels/tokens -> telemetry.csv
 """
 
 import heapq
@@ -25,8 +26,17 @@ MANIFEST = {
 
 
 def run_tool(tool: str, args: dict, attempt: int, faults: set) -> dict:
-    if tool in faults and attempt == 1:
-        return {"ok": False, "error": "upstream_timeout"}
+    # faults entries are either a bare tool name (fails on attempt 1 only,
+    # the original semantics every existing scenario relies on) or a
+    # (tool, n) pair meaning "fails on every attempt up to and including n" -
+    # used to test what happens once the retry budget is actually exhausted.
+    for f in faults:
+        if isinstance(f, tuple):
+            fname, n = f
+            if tool == fname and attempt <= n:
+                return {"ok": False, "error": "upstream_timeout"}
+        elif tool == f and attempt == 1:
+            return {"ok": False, "error": "upstream_timeout"}
     if tool == "search_flights":
         return {"ok": True, "flights": [f"{args['destination'][:3].upper()}-101",
                                         f"{args['destination'][:3].upper()}-204"]}
@@ -153,7 +163,78 @@ SCENARIOS = [
                    "called_with": [("book_flight", {"flight_id": "GOA-101",
                                                     "seat": "GOA-101:12A"})]},
     },
+    {
+        # The correction event and the stale call's tool_result share the exact
+        # same virtual-clock timestamp (0.9 = search_flights latency). Adversarial
+        # timing is explicitly called out in the spec's hidden-set description;
+        # this pins the tie-break so it can't regress silently. Scenario events
+        # get lower sequence numbers than results generated during the run, so
+        # the correction is applied first and the stale result is dropped as
+        # cancelled rather than being read at all.
+        "name": "interrupt lands at the exact instant a tool returns",
+        "multimodal": False,
+        "faults": set(),
+        "events": [
+            (0.0, {"kind": "chunk", "text": "flight from Delhi to Mumbai tomorrow"}),
+            (0.9, {"kind": "interrupt", "text": "wait, to Goa instead"}),
+            (2.5, {"kind": "chunk", "text": "book it", "final": True}),
+        ],
+        "expect": {"tools_ok": {"search_flights", "book_flight"},
+                   "cancels": 1,
+                   "slots": {"origin": "delhi", "destination": "goa",
+                             "date": "2026-09-15", "commit": True},
+                   "never_called_with": [("book_flight", {"flight_id": "MUM-101"})]},
+    },
+    {
+        # The organisers' harness can deliver events after the agent has already
+        # emitted a FINAL for a prior turn. A correction here must not roll back
+        # a completed booking (it's already real, un-bookable) but it must still
+        # be treated as a live instruction, not dropped on the floor.
+        "name": "correction arrives after the final marker",
+        "multimodal": False,
+        "faults": set(),
+        "events": [
+            (0.0, {"kind": "chunk", "text": "flight from Delhi to Mumbai tomorrow"}),
+            (1.5, {"kind": "chunk", "text": "book it", "final": True}),
+            (5.0, {"kind": "chunk", "text": "wait, to Goa instead", "final": True}),
+        ],
+        "expect": {"tools_ok": {"search_flights", "check_seat_availability", "book_flight"},
+                   "cancels": 0,
+                   "slots": {"origin": "delhi", "destination": "goa",
+                             "date": "2026-09-15", "commit": True},
+                   "called_with": [("book_flight", {"flight_id": "GOA-101"})]},
+    },
+    {
+        # Two corrections 20ms apart, no time for anything to resolve between
+        # them. Exercises the coordinator's own cancel/replan path independent
+        # of the extractor (see the "known gaps" note below the SCENARIOS list) -
+        # both hops must cancel cleanly, and hitting REVISION_CAP on the same
+        # slot must escalate to a confirm rather than booking on a guess.
+        "name": "rapid double correction escalates to a confirm",
+        "multimodal": False,
+        "faults": set(),
+        "events": [
+            (0.0, {"kind": "chunk", "text": "flight from Delhi to Mumbai tomorrow"}),
+            (0.3, {"kind": "interrupt", "text": "no, to Goa"}),
+            (0.32, {"kind": "interrupt", "text": "actually, to Pune"}),
+            (3.0, {"kind": "chunk", "text": "book it", "final": True}),
+        ],
+        "expect": {"tools_ok": {"search_flights", "check_seat_availability"},
+                   "cancels": 2, "clarify": True,
+                   "slots": {"origin": "delhi", "destination": "pune",
+                             "date": "2026-09-15", "commit": True}},
+    },
 ]
+
+# --- known gap, not fixed here (out of scope for harness.py) ----------------
+# _extract only recognises a destination change when the city is preceded by
+# "to"/"for"/"from". A correction phrased WITHOUT that word - "no, Goa",
+# "actually Pune", "make that Goa" alone - is silently dropped: no error, no
+# clarify, the agent just keeps the old destination and can book the wrong
+# city with a clean trace. Confirmed in a scratch run, not encoded as a scored
+# scenario here because the fix belongs in perception.py's LLM-based extract
+# (the keyword matcher is a documented placeholder, see CLAUDE.md). Flagging
+# it so whoever swaps in the real extractor knows to test this phrasing.
 
 SUBSTANTIVE = {SAY, CALL, CLARIFY, FINAL}
 
@@ -305,9 +386,69 @@ def score(scn, run) -> tuple[float, list[str]]:
     return total, notes
 
 
-# --- main ------------------------------------------------------------------
+# --- telemetry ---------------------------------------------------------
+# Per-scenario metrics for the deck's metrics table: latency, cancel counts,
+# and a token-cost figure. This is GenAI's deliverable, feeding Full-stack's
+# deck - not agent behaviour, just measurement of it.
 
-def main(quiet=False):
+def telemetry(scn, run) -> dict:
+    trace = run["trace"]
+    outs = [e for e in trace if e["dir"] == "out"]
+    ins = [e for e in trace if e["dir"] == "in" and e["kind"] not in ("tool_result", "tick")]
+
+    # Same definition of "responded" the scorer uses: time from a real user
+    # input to the first substantive (SAY/CALL/CLARIFY/FINAL) output at or
+    # after it. This is literally the Response Latency rubric line (15%),
+    # just reported per-input instead of collapsed into a single deduction.
+    lats = []
+    for e in ins:
+        after = [o for o in outs if o["t"] >= e["t"] and o["kind"] in SUBSTANTIVE]
+        if after:
+            lats.append(min(o["t"] for o in after) - e["t"])
+    mean_latency = round(sum(lats) / len(lats), 3) if lats else None
+    max_latency = round(max(lats), 3) if lats else None
+
+    cancels = sum(1 for o in outs if o["kind"] == CANCEL)
+
+    # Token cost is a PROXY, not a real LLM bill: today's extractor
+    # (agent._extract) is a deterministic keyword matcher - zero LLM calls,
+    # zero tokens. Once perception.py's LLM-based extract() replaces it, swap
+    # this for the actual usage the API reports (prompt + completion tokens
+    # per extract() call). Until then, word count of everything the extractor
+    # would see stands in for it, so this column - and the deck slot for it -
+    # exists now and only the numbers change later, not the column layout.
+    words = sum(len((e.get("text") or e.get("caption") or "").split()) for e in ins)
+
+    return {"name": scn["name"], "mean_latency_s": mean_latency,
+            "max_latency_s": max_latency, "cancels": cancels,
+            "token_cost_proxy": words}
+
+
+def telemetry_table(write_csv=True) -> list[dict]:
+    """Run every scenario, print a metrics table, and (by default) write
+    telemetry.csv next to harness.py - Full-stack reads that file for the
+    deck's metrics table, no need to touch this file."""
+    rows = [telemetry(scn, simulate(scn)) for scn in SCENARIOS]
+
+    print(f"{'scenario':48} {'mean_lat':>9} {'max_lat':>9} {'cancels':>8} {'tokens*':>8}")
+    for r in rows:
+        ml = f"{r['mean_latency_s']:.3f}" if r["mean_latency_s"] is not None else "-"
+        xl = f"{r['max_latency_s']:.3f}" if r["max_latency_s"] is not None else "-"
+        print(f"{r['name'][:48]:48} {ml:>9} {xl:>9} {r['cancels']:>8} {r['token_cost_proxy']:>8}")
+    print("\n* token_cost_proxy is a word-count stand-in until the LLM extractor lands (see docstring)")
+
+    if write_csv:
+        import csv
+        with open("telemetry.csv", "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=["name", "mean_latency_s", "max_latency_s",
+                                              "cancels", "token_cost_proxy"])
+            w.writeheader()
+            w.writerows(rows)
+        print("\nwrote telemetry.csv")
+    return rows
+
+
+
     totals = []
     for scn in SCENARIOS:
         run = simulate(scn)
@@ -438,11 +579,37 @@ def _selfcheck():
         pts, why = score(scn, no_tick)
         assert pts == 100.0, f"no-tick replay: {scn['name']} scored {pts}: {why}"
 
+    # -- retry budget across turns: pinned, not endorsed --------------------
+    # MAX_RETRIES=1 caps automatic back-to-back retries fired from _on_result.
+    # It does NOT cap attempts overall: any later chunk re-enters _plan, which
+    # re-issues the call fresh (nothing in _ensure checks the retries counter,
+    # only _retry does). So a tool that fails on every attempt still gets
+    # retried again the next time the user says anything at all - here, a
+    # third attempt succeeds after two straight failures. This assertion pins
+    # today's behaviour so a future change to the policy shows up as a diff
+    # here rather than silently, not a claim that 3 attempts is the right cap.
+    # Raise with Anant: is this the intended resilience, or should a call that
+    # has burned its retry budget stay dead until its own slots change again?
+    persistent = {"name": "persistent failure exhausts the retry budget",
+                  "multimodal": False, "faults": {("search_flights", 2)}, "events": [
+        (0.0, {"kind": "chunk", "text": "flight from Delhi to Goa tomorrow"}),
+        (4.0, {"kind": "chunk", "text": "that is all", "final": True}),
+    ]}
+    run = simulate(persistent)
+    attempts = _out(run, CALL, "search_flights")
+    assert len(attempts) == 3, \
+        f"expected 3 search_flights attempts (1 + 1 retry + 1 re-plan on the next chunk), got {len(attempts)}"
+    assert any(e["dir"] == "in" and e["kind"] == "tool_result" and e["tool"] == "search_flights"
+               and e["result"].get("ok") for e in run["trace"]), \
+        "the third attempt should still succeed once the fault window passes"
+
     print("selfcheck ok")
 
 
 if __name__ == "__main__":
     if "--selfcheck" in sys.argv:
         _selfcheck()
+    elif "--telemetry" in sys.argv:
+        telemetry_table()
     else:
         main(quiet="-q" in sys.argv)
