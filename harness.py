@@ -14,7 +14,7 @@ import heapq
 import json
 import sys
 
-from agent import Agent, CALL, CANCEL, CLARIFY, FINAL, SAY
+from agent import Agent, CALL, CANCEL, CLARIFY, FINAL, SAY, _idem
 
 # --- tool manifest & mocks -------------------------------------------------
 
@@ -47,7 +47,9 @@ def run_tool(tool: str, args: dict, attempt: int, faults: set) -> dict:
         return {"ok": True, "flight_id": args["flight_id"],
                 "seats": [f"{args['flight_id']}:12A", f"{args['flight_id']}:14C"]}
     if tool == "book_flight":
-        return {"ok": True, "booking_ref": f"PNR{abs(hash(json.dumps(args, sort_keys=True))) % 10000:04d}"}
+        # sha256 over canonical args, like _idem - never built-in hash(), which
+        # is seed-randomised per process and would break trace determinism
+        return {"ok": True, "booking_ref": f"PNR{int(_idem(tool, args), 16) % 10000:04d}"}
     return {"ok": True}
 
 
@@ -614,6 +616,12 @@ def _selfcheck():
     # fetches: {"trace": [...]} with every entry serialisable as-is
     payload = json.loads(json.dumps({"trace": simulate(SCENARIOS[0])["trace"]}))
     assert payload["trace"] and all("t" in e and "kind" in e for e in payload["trace"])
+    # a literal booking ref only holds if it is derived process-independently
+    # (sha256, not seed-randomised hash()) - this fails on the next run if
+    # trace determinism regresses
+    refs = [e["result"]["booking_ref"] for e in payload["trace"]
+            if e.get("kind") == "tool_result" and e["result"].get("booking_ref")]
+    assert refs == ["PNR7240"], f"booking_ref not deterministic across processes: {refs}"
 
     # ticks are an optimisation, not a requirement: a replayed event stream
     # with no timer support must still complete every booking at full score
