@@ -384,13 +384,20 @@ function App() {
                 // the kill edge burns red while the cancellation is the
                 // current subject, then settles: the closing frame is about
                 // the booking that resolved, not the call that died
-                const hot = dead && playhead - c.cancelT < 1.2;
+                const HOT = 1.2; // trace-seconds a call stays the subject
+                const hot = dead && playhead - c.cancelT < HOT;
+                // a call that finished (or whose kill cooled) more than the
+                // subject-window ago is old news: its edges stay traceable
+                // at ~20% but stop competing with whatever is happening now
+                const quiet = dead
+                  ? playhead - c.cancelT >= HOT
+                  : c.result && seen(c.end) && playhead - c.end >= HOT;
                 const cls =
                   "wire" +
                   (e.derived ? " derived" : "") +
                   (!e.derived && dead && c.by.includes(e.slot)
                     ? hot ? " red" : " cooled"
-                    : "");
+                    : quiet ? " quiet" : "");
                 return <line key={i} className={cls} x1={a.x} y1={a.y} x2={b.x} y2={b.y} />;
               })}
             </svg>

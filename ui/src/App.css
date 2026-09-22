@@ -243,6 +243,9 @@ body {
 .wire.red { stroke: var(--red); stroke-width: 2; opacity: 0.95; }
 /* after the cancellation stops being the subject: still traceable, no alarm */
 .wire.cooled { stroke: var(--red); opacity: 0.25; }
+/* a finished call that is no longer the beat's subject: old news */
+.wire.quiet { opacity: 0.2; }
+.wire.derived.quiet { opacity: 0.12; }
 
 .node {
   position: absolute;
