@@ -1,52 +1,140 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import "./App.css";
 
-// One screen, one story: a tool call dies at the instant a slot changes,
-// while unrelated calls keep running. Everything shares a single time axis
-// so "while" is visible without scrolling.
+// Two panels, one clock. Left: the conversation as a chat thread - time
+// flows downward, so speaking order is unambiguous. Right: one card per
+// tool call. The pairing is the point: when the correction message appears
+// on the left, the card it invalidates dies on the right at the same
+// moment, while unrelated cards keep running.
 
 const SLOT_KEYS = ["origin", "destination", "date", "pax"];
-const SPEED = 2; // trace-seconds per wall-second (~2x real time)
-const LOOP_PAUSE_MS = 1400; // hold on the finished frame, then loop
+const SLOT_NAMES = { origin: "origin", destination: "destination", date: "date", pax: "passengers" };
+const STEP_SPEED = 3.5; // trace-seconds per wall-second while stepping
+const FLAGSHIP = "mid-utterance destination change";
 
-function summarise(result) {
-  if (!result) return "";
-  if (result.booking_ref) return result.booking_ref;
-  if (result.flights) return `${result.flights.length} flights`;
-  if (result.seats) return `${result.seats.length} seats`;
-  return result.ok ? "ok" : result.error || "failed";
+// Offered in the picker. The export still carries every scenario; these are
+// the five with something to watch.
+const PICKER = [
+  "mid-utterance destination change",
+  "duplicate booking guard",
+  "correction arrives after the final marker",
+  "rapid double correction escalates to a confirm",
+  "multimodal: frame grounding behind an acknowledgment",
+];
+
+const AUTHORED_BEATS = [
+  {
+    t: 0.3,
+    title: "Searching Delhi → Mumbai",
+    caption: "The user is still speaking. We start the search anyway.",
+  },
+  {
+    t: 0.7,
+    title: "User changes their mind",
+    caption: (
+      <>
+        Destination changed. Only calls that read <code>destination</code> are cancelled.
+      </>
+    ),
+  },
+  {
+    t: 2.0,
+    title: "The rest survives",
+    caption: "Origin, date and passenger count were never touched, so no work was wasted.",
+  },
+  {
+    t: 3.9,
+    title: "Booked on Goa",
+    caption: "One booking. One PNR. The Mumbai search never reached a payment.",
+  },
+];
+
+const cap = (s) => String(s).replace(/\b[a-z]/g, (m) => m.toUpperCase());
+
+// Plain words on every card - no bare identifiers where a judge looks.
+function cardTitle(c) {
+  const a = c.args || {};
+  if (c.tool === "search_flights" && a.destination)
+    return `Searching flights · ${cap(a.origin ?? "?")} → ${cap(a.destination)}`;
+  if (c.tool === "check_seat_availability" && a.flight_id)
+    return `Checking seats · ${a.flight_id}`;
+  if (c.tool === "book_flight") {
+    const seat = (a.seat || "").split(":")[1] || a.seat || "?";
+    return `Booking · seat ${seat} on ${a.flight_id} ×${a.pax ?? 1}`;
+  }
+  return c.tool;
 }
 
-function argHint(args) {
-  if (!args) return "";
-  if (args.seat) return `${args.seat} ×${args.pax ?? 1}`;
-  if (args.flight_id) return args.flight_id;
-  if (args.destination) return `${args.origin ?? "?"}→${args.destination}`;
-  return "";
+function cardResult(r) {
+  if (!r) return "";
+  if (r.booking_ref) return `Booked · ref ${r.booking_ref}`;
+  if (r.flights) return `Found ${r.flights.length} flights`;
+  if (r.seats) return `${r.seats.length} seats free`;
+  return r.ok ? "Done" : r.error || "Failed";
+}
+
+// Generic beats for scenarios without authored copy.
+function deriveBeats(trace, tEnd) {
+  const first = (pred) => trace.find(pred);
+  const call = first((e) => e.kind === "call");
+  const cancel = first((e) => e.kind === "cancel");
+  const clarify = first((e) => e.kind === "clarify");
+  const result = first((e) => e.kind === "tool_result");
+  const finals = trace.filter((e) => e.kind === "final");
+  const closing =
+    finals[finals.length - 1] ||
+    [...trace].reverse().find((e) => e.kind === "clarify") ||
+    trace[trace.length - 1];
+
+  const cand = [];
+  if (call) cand.push({ t: call.t, caption: "The first tool call goes out." });
+  if (cancel) cand.push({ t: cancel.t, caption: "A call is cancelled — a value it depends on changed." });
+  else if (clarify) cand.push({ t: clarify.t, caption: "Instead of guessing, the agent asks." });
+  if (result) cand.push({ t: result.t, caption: "The first result comes back and is kept." });
+  if (closing)
+    cand.push({
+      t: closing.t,
+      caption:
+        closing.kind === "final" ? "The agent gives its final answer."
+        : closing.kind === "clarify" ? "Instead of guessing, the agent asks."
+        : "The turn ends.",
+    });
+
+  const beats = [];
+  for (const b of cand.sort((a, c) => a.t - c.t)) {
+    const t = Math.min(b.t + 0.1, Math.max(tEnd, 0));
+    if (!beats.some((x) => Math.abs(x.t - t) < 0.05)) beats.push({ ...b, t });
+  }
+  return beats;
 }
 
 function App() {
-  const [trace, setTrace] = useState([]);
-  const [scenario, setScenario] = useState("");
+  const [scenarios, setScenarios] = useState([]);
+  const [sel, setSel] = useState(0);
+  const [view, setView] = useState("timeline");
   const [playhead, setPlayhead] = useState(0);
-  const [playing, setPlaying] = useState(true);
+  const [target, setTarget] = useState(null);
   const rawRef = useRef("");
-  const clockRef = useRef({ last: 0, holdUntil: 0 });
-  const liveRef = useRef({ playing: true, tEnd: 0 });
+  const threadRef = useRef(null);
 
-  // Data contract unchanged: poll /trace.json once a second. Only reset the
-  // animation when the file actually changed.
+  // Data contract unchanged: poll /trace.json once a second, reset only when
+  // the file actually changed. Old single-scenario files still work.
   useEffect(() => {
     const loadTrace = () => {
       fetch("/trace.json?t=" + Date.now())
         .then((res) => res.json())
         .then((data) => {
-          const s = JSON.stringify(data.trace || []);
+          const s = JSON.stringify(data);
           if (s !== rawRef.current) {
             rawRef.current = s;
-            setTrace(data.trace || []);
-            setScenario(data.scenario || "");
+            const all = data.scenarios || [
+              { name: data.scenario || "trace", blurb: "", multimodal: false, trace: data.trace || [] },
+            ];
+            const offered = PICKER.map((n) => all.find((x) => x.name === n)).filter(Boolean);
+            setScenarios(offered.length ? offered : all);
+            setSel(0);
             setPlayhead(0);
+            setTarget(null);
           }
         })
         .catch((err) => console.error(err));
@@ -56,23 +144,27 @@ function App() {
     return () => clearInterval(interval);
   }, []);
 
+  const current = scenarios[sel] || { name: "", blurb: "", multimodal: false, trace: [] };
+  const trace = current.trace;
+  const authored = current.name === FLAGSHIP;
+
   const model = useMemo(() => {
     const calls = [];
     const byId = {};
-    const utterances = [];
-    const speech = [];
-    const slotChanges = []; // {t, key, value} recovered from call args
+    const thread = [];
+    const slotChanges = [];
     const lastSeen = {}; // a re-issued call re-states unchanged slots: not a change
     let tEnd = 0;
     for (const e of trace) {
       tEnd = Math.max(tEnd, e.t || 0);
       if (e.kind === "call" && e.dir === "out") {
-        const lane = {
-          id: e.call_id, tool: e.tool, args: e.args, start: e.t,
-          end: null, cancelled: false, cancelT: null, by: [], result: null,
+        const c = {
+          id: e.call_id, tool: e.tool, args: e.args, mutating: e.mutating,
+          reads: e.reads || [],
+          start: e.t, end: null, cancelled: false, cancelT: null, by: [], result: null,
         };
-        calls.push(lane);
-        byId[e.call_id] = lane;
+        calls.push(c);
+        byId[e.call_id] = c;
         for (const k of SLOT_KEYS)
           if (e.args && e.args[k] !== undefined && lastSeen[k] !== e.args[k]) {
             lastSeen[k] = e.args[k];
@@ -88,199 +180,317 @@ function App() {
         byId[e.call_id].end = e.t;
         byId[e.call_id].result = e.result;
       } else if (e.kind === "chunk" || e.kind === "interrupt") {
-        utterances.push(e);
-      } else if (e.kind === "say" || e.kind === "final") {
-        speech.push(e);
+        thread.push({ t: e.t, side: "user", text: e.text, correction: e.kind === "interrupt" });
+      } else if (e.kind === "frame" || e.kind === "audio") {
+        thread.push({ t: e.t, side: "user", text: e.caption || "(audio)", frame: true });
+      } else if (e.kind === "say" || e.kind === "final" || e.kind === "clarify") {
+        thread.push({ t: e.t, side: "agent", text: e.text, kind: e.kind });
       }
     }
     for (const c of calls) if (c.end === null) c.end = tEnd;
-    const T = Math.max(tEnd, 0.001) * 1.08; // breathing room on the right
-    const cancels = calls.filter((c) => c.cancelled);
-    return { calls, utterances, speech, slotChanges, cancels, T, tEnd };
+    return { calls, thread, slotChanges, tEnd };
   }, [trace]);
 
-  liveRef.current = { playing, tEnd: model.tEnd };
+  const beats = useMemo(
+    () => (authored ? AUTHORED_BEATS : deriveBeats(trace, model.tEnd)),
+    [authored, trace, model.tEnd]
+  );
 
-  // Autoplay: rAF drives the playhead; bars grow because their fill width is
-  // a pure function of the playhead. Loop with a short hold at the end.
+  // Dependency tree: static layout, computed once per scenario. Depth comes
+  // from real derivation - a call whose argument value appeared in an earlier
+  // call's result sits one row below that call. Edges run slot -> call for
+  // every slot in the call's (transitively inherited) reads: that is what
+  // the timeline cannot show.
+  const tree = useMemo(() => {
+    const flat = (v, out = []) => {
+      if (v == null) return out;
+      if (Array.isArray(v)) v.forEach((x) => flat(x, out));
+      else if (typeof v === "object") Object.values(v).forEach((x) => flat(x, out));
+      else out.push(String(v));
+      return out;
+    };
+    const calls = model.calls.map((c) => ({ ...c, depth: 1, parent: null, supersededAt: null }));
+    for (const c of calls) {
+      const argVals = Object.values(c.args || {}).map(String);
+      for (const p of calls) {
+        if (p === c || !p.result || p.end > c.start + 1e-9) continue;
+        if (p.depth >= c.depth && flat(p.result).some((v) => argVals.includes(v))) {
+          c.depth = p.depth + 1;
+          c.parent = p.id;
+        }
+      }
+      // a completed mutation whose reads went stale afterwards was NOT
+      // cancelled - it is still active in the world, and must render so
+      if (c.mutating && c.result?.ok && !c.cancelled) {
+        const hit = model.slotChanges.find((s) => s.t > c.end && c.reads.includes(s.key));
+        if (hit) c.supersededAt = hit.t;
+      }
+    }
+    const maxDepth = Math.max(1, ...calls.map((c) => c.depth));
+    const pos = {};
+    SLOT_KEYS.forEach((k, i) => {
+      pos[k] = { x: ((i + 0.5) / SLOT_KEYS.length) * 100, y: 10 };
+    });
+    for (let d = 1; d <= maxDepth; d++) {
+      const row = calls.filter((c) => c.depth === d).sort((a, b) => a.start - b.start);
+      row.forEach((c, j) => {
+        pos[c.id] = {
+          x: ((j + 0.5) / row.length) * 100,
+          y: 10 + (d * 80) / Math.max(maxDepth, 2),
+        };
+      });
+    }
+    const edges = [];
+    for (const c of calls) {
+      for (const s of c.reads) if (pos[s]) edges.push({ from: s, to: c.id, slot: s, call: c });
+      if (c.parent) edges.push({ from: c.parent, to: c.id, derived: true, call: c });
+    }
+    return { calls, edges, pos };
+  }, [model]);
+
+  // Stepping: tween the playhead toward the requested beat. Anchored to wall
+  // time with a snap timeout so a step always lands even if rAF frames stall.
+  const playheadRef = useRef(0);
+  playheadRef.current = playhead;
   useEffect(() => {
+    if (target === null) return;
+    const from = playheadRef.current;
+    const dur = (Math.abs(target - from) / STEP_SPEED) * 1000;
+    if (dur < 16) {
+      setPlayhead(target);
+      setTarget(null);
+      return;
+    }
+    const t0 = performance.now();
     let raf;
     const step = (now) => {
-      const c = clockRef.current;
-      const dt = c.last ? (now - c.last) / 1000 : 0;
-      c.last = now;
-      const { playing, tEnd } = liveRef.current;
-      if (playing && tEnd > 0 && now >= c.holdUntil) {
-        setPlayhead((p) => {
-          if (p >= tEnd) return 0; // hold finished: loop
-          const n = p + dt * SPEED;
-          if (n >= tEnd) {
-            c.holdUntil = now + LOOP_PAUSE_MS;
-            return tEnd;
-          }
-          return n;
-        });
-      }
-      raf = requestAnimationFrame(step);
+      const k = Math.min((now - t0) / dur, 1);
+      setPlayhead(from + (target - from) * k);
+      if (k >= 1) setTarget(null);
+      else raf = requestAnimationFrame(step);
     };
     raf = requestAnimationFrame(step);
-    return () => cancelAnimationFrame(raf);
-  }, []);
+    const snap = setTimeout(() => {
+      setPlayhead(target);
+      setTarget(null);
+    }, dur + 400);
+    return () => {
+      cancelAnimationFrame(raf);
+      clearTimeout(snap);
+    };
+  }, [target]);
 
-  const x = (t) => `${(t / model.T) * 100}%`;
-  const w = (d) => `${(d / model.T) * 100}%`;
+  const beat = beats.reduce((n, b) => (playhead >= b.t - 1e-6 ? n + 1 : n), 0);
+  const next = () => beat < beats.length && setTarget(beats[beat].t);
+  const back = () => setTarget(beat > 1 ? beats[beat - 2].t : 0);
+
+  useEffect(() => {
+    const onKey = (e) => {
+      if (e.key === "ArrowRight") next();
+      if (e.key === "ArrowLeft") back();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  });
+
   const seen = (t) => playhead >= t - 1e-9;
+  const visibleMsgs = model.thread.filter((m) => seen(m.t));
+  const visibleCalls = model.calls.filter((c) => seen(c.start));
 
-  const scrub = (v) => {
-    clockRef.current.holdUntil = 0;
-    setPlayhead(Number(v));
-  };
+  // the thread grows downward; keep the newest message in view
+  useEffect(() => {
+    const el = threadRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [visibleMsgs.length]);
 
-  const gridSeconds = [];
-  for (let s = 0; s <= Math.floor(model.tEnd); s++) gridSeconds.push(s);
+  const banner = authored
+    ? beat === 0
+      ? { n: null, title: cap(current.name), caption: "Step through with Next." }
+      : { n: beat, ...AUTHORED_BEATS[beat - 1] }
+    : beat === 0
+      ? { n: null, title: cap(current.name), caption: "Step through with Next." }
+      : { n: beat, title: beats[beat - 1].caption, caption: null };
 
   return (
     <div className="app">
       <header className="top">
-        <div className="title">
-          <span className="brand">PRISM</span>
-          <span className="scenario">{scenario}</span>
-        </div>
-        <div className="legend">
-          <span><i className="sw running" /> running</span>
-          <span><i className="sw done" /> completed</span>
-          <span><i className="sw killed" /> cancelled</span>
+        <span className="brand">PRISM</span>
+        <select
+          className="picker"
+          value={sel}
+          onChange={(e) => {
+            setSel(Number(e.target.value));
+            setPlayhead(0);
+            setTarget(null);
+          }}
+        >
+          {scenarios.map((s, i) => (
+            <option key={s.name} value={i}>
+              {cap(s.name)}{s.multimodal ? "  (multimodal)" : ""}
+            </option>
+          ))}
+        </select>
+        <div className="viewtoggle">
+          <button className={view === "timeline" ? "on" : ""} onClick={() => setView("timeline")}>
+            Timeline
+          </button>
+          <button className={view === "tree" ? "on" : ""} onClick={() => setView("tree")}>
+            Tree
+          </button>
         </div>
         <div className="controls">
-          <button className="playbtn" onClick={() => setPlaying((p) => !p)}>
-            {playing ? "❚❚" : "▶"}
-          </button>
           <input
             type="range" min="0" max={model.tEnd || 1} step="0.01"
             value={Math.min(playhead, model.tEnd || 1)}
-            onChange={(e) => scrub(e.target.value)}
+            onChange={(e) => { setTarget(null); setPlayhead(Number(e.target.value)); }}
           />
           <span className="clock mono">t={playhead.toFixed(2)}s</span>
         </div>
       </header>
 
-      <main className="board">
-        {/* ---- utterance track ---- */}
-        <div className="row utt-row">
-          <div className="label">user</div>
-          <div className="rail">
-            {model.utterances.map((u, i) => (
-              <div
-                key={i}
-                className={
-                  "utt" +
-                  (u.kind === "interrupt" ? " correction" : "") +
-                  (seen(u.t) ? "" : " future") +
-                  (i % 2 ? " low" : "") +
-                  (u.t / model.T > 0.72 ? " end" : "")
-                }
-                style={{ left: x(u.t) }}
-              >
-                <span className="utt-text">
-                  “{u.text}”<b className="mono"> {u.t.toFixed(1)}s</b>
-                </span>
-                <span className="utt-dot" />
-              </div>
-            ))}
-          </div>
-        </div>
+      {current.blurb && <p className="blurb">{current.blurb}</p>}
 
-        {/* ---- call lanes ---- */}
-        {model.calls.map((c) => {
-          const started = seen(c.start);
-          const dur = Math.max(c.end - c.start, 0.02);
-          const fill = Math.max(0, Math.min(playhead, c.end) - c.start) / dur;
-          const dead = c.cancelled && seen(c.cancelT);
-          const finished = !c.cancelled && seen(c.end) && c.result;
-          const cls =
-            "bar" +
-            (dead ? " killed" : finished ? " done" : started ? " running" : "");
-          return (
-            <div className="row lane" key={c.id}>
-              <div className={"label" + (started ? "" : " future")}>
-                <span className="mono tool">{c.tool}</span>
-                <span className="mono meta">{c.id} · {argHint(c.args)}</span>
-              </div>
-              <div className="rail">
-                <div className={cls} style={{ left: x(c.start), width: w(dur) }}>
-                  <i className="fill" style={{ width: `${fill * 100}%` }} />
-                  <i className="strike" />
+      <section className="banner">
+        <div className="banner-text">
+          <h1>
+            {banner.n && <span className="beat-n mono">{banner.n}/{beats.length}</span>}
+            {banner.title}
+          </h1>
+          {banner.caption && <p className="cap">{banner.caption}</p>}
+        </div>
+        <div className="steps">
+          <button className="step back" onClick={back} disabled={beat === 0 && playhead === 0}>
+            ← Back
+          </button>
+          <button className="step next" onClick={next} disabled={beat === beats.length}>
+            Next →
+          </button>
+        </div>
+      </section>
+
+      {view === "tree" && (
+        <main className="treewrap">
+          <div className="graph">
+            <svg className="wires" viewBox="0 0 100 100" preserveAspectRatio="none">
+              {tree.edges.map((e, i) => {
+                const a = tree.pos[e.from];
+                const b = tree.pos[e.to];
+                if (!a || !b) return null;
+                const c = e.call;
+                const dead = c.cancelled && seen(c.cancelT);
+                const cls =
+                  "wire" +
+                  (e.derived ? " derived" : "") +
+                  (!e.derived && dead && c.by.includes(e.slot) ? " red" : "") +
+                  (seen(c.start) ? "" : " ghost");
+                return <line key={i} className={cls} x1={a.x} y1={a.y} x2={b.x} y2={b.y} />;
+              })}
+            </svg>
+            {SLOT_KEYS.map((k) => {
+              const past = model.slotChanges.filter((s) => s.key === k && seen(s.t));
+              const cur = past.length ? past[past.length - 1] : null;
+              const flash = cur && cur.t > 0 && playhead - cur.t < 0.9 && playhead < model.tEnd;
+              const p = tree.pos[k];
+              return (
+                <div
+                  key={k}
+                  className={"node slotnode" + (flash ? " flash" : "")}
+                  style={{ left: `${p.x}%`, top: `${p.y}%` }}
+                >
+                  <span className="node-key">{SLOT_NAMES[k]}</span>
+                  <span className="node-val mono">{cur === null ? "—" : String(cur.value)}</span>
                 </div>
-                {c.cancelled && (
-                  <div
-                    className={"invalidated mono" + (dead ? " show" : "")}
-                    style={{ left: x(c.start) }}
-                  >
-                    invalidated_by: {c.by.join(", ")}
-                  </div>
-                )}
-                {finished && (
-                  <div className="result mono" style={{ left: x(c.end) }}>
-                    {summarise(c.result)}
-                  </div>
-                )}
-              </div>
-            </div>
-          );
-        })}
+              );
+            })}
+            {tree.calls.map((c) => {
+              const p = tree.pos[c.id];
+              const dead = c.cancelled && seen(c.cancelT);
+              const stale = c.supersededAt !== null && seen(c.supersededAt);
+              const finished = !c.cancelled && seen(c.end) && c.result;
+              const running = seen(c.start) && !dead && !finished;
+              const cls =
+                "node callnode" +
+                (seen(c.start) ? "" : " ghost") +
+                (dead ? " killed" : stale ? " stale" : finished ? " done" : running ? " running" : "");
+              return (
+                <div key={c.id} className={cls} style={{ left: `${p.x}%`, top: `${p.y}%` }}>
+                  <span className="node-title">{cardTitle(c)}</span>
+                  {dead ? (
+                    <span className="node-status red-text">
+                      cancelled — {c.by.map((s) => SLOT_NAMES[s] || s).join(", ")} changed
+                    </span>
+                  ) : finished ? (
+                    <span className="node-status">
+                      {cardResult(c.result)}
+                      {stale && <b className="still mono">STILL ACTIVE</b>}
+                    </span>
+                  ) : running ? (
+                    <span className="node-status">running…</span>
+                  ) : (
+                    <span className="node-status">not issued yet</span>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </main>
+      )}
 
-        {/* ---- agent speech strip ---- */}
-        <div className="row speech-row">
-          <div className="label">agent</div>
-          <div className="rail">
-            {model.speech.map((s, i) => (
+      {view === "timeline" && (
+      <main className="panels">
+        {/* ---- conversation thread ---- */}
+        <section className="thread" ref={threadRef}>
+          {visibleMsgs.map((m, i) => (
+            <div key={i} className={"msg " + m.side + (m.kind === "say" ? "" : " strong")}>
               <div
-                key={i}
                 className={
-                  "tick" +
-                  (s.kind === "final" ? " final" : "") +
-                  (seen(s.t) ? "" : " future") +
-                  (i % 2 ? " low" : "") +
-                  (s.t / model.T > 0.72 ? " end" : "")
+                  "bubble" +
+                  (m.correction ? " correction" : "") +
+                  (m.frame ? " frame" : "")
                 }
-                style={{ left: x(s.t) }}
               >
-                <span className="tick-mark" />
-                <span className="tick-text">{s.text}</span>
+                {m.correction && <span className="tag">correction</span>}
+                {m.frame && <span className="tag neutral">camera</span>}
+                {m.text}
               </div>
-            ))}
-          </div>
-        </div>
-
-        {/* ---- time axis ---- */}
-        <div className="row axis-row">
-          <div className="label" />
-          <div className="rail">
-            {gridSeconds.map((s) => (
-              <span key={s} className="axis-label mono" style={{ left: x(s) }}>
-                {s}s
-              </span>
-            ))}
-          </div>
-        </div>
-
-        {/* ---- overlay: gridlines, hero cancel line, playhead ---- */}
-        <div className="overlay">
-          {gridSeconds.map((s) => (
-            <i key={s} className="grid" style={{ left: x(s) }} />
+              <span className="stamp mono">{m.t.toFixed(1)}s</span>
+            </div>
           ))}
-          {model.cancels.map((c) => (
-            <i
-              key={c.id}
-              className={"heroline" + (seen(c.cancelT) ? " show" : "")}
-              style={{ left: x(c.cancelT) }}
-            />
-          ))}
-          <i className="playhead" style={{ left: x(Math.min(playhead, model.tEnd)) }} />
-        </div>
+        </section>
+
+        {/* ---- work panel: one card per tool call ---- */}
+        <section className="work">
+          {visibleCalls.map((c) => {
+            const dead = c.cancelled && seen(c.cancelT);
+            const finished = !c.cancelled && seen(c.end) && c.result;
+            const running = !dead && !finished;
+            const dur = Math.max(c.end - c.start, 0.02);
+            const fill = Math.max(0, Math.min(playhead, c.end) - c.start) / dur;
+            return (
+              <div key={c.id} className={"card" + (dead ? " killed" : finished ? " done" : "")}>
+                <div className="card-head">
+                  <span className="card-title">{cardTitle(c)}</span>
+                  <span className="stamp mono">{c.start.toFixed(1)}s</span>
+                </div>
+                {running && (
+                  <div className="progress">
+                    <i style={{ width: `${fill * 100}%` }} />
+                  </div>
+                )}
+                {finished && <div className="card-result">{cardResult(c.result)}</div>}
+                {dead && (
+                  <div className="card-cancel">
+                    cancelled — {c.by.map((s) => SLOT_NAMES[s] || s).join(", ")} changed
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </section>
       </main>
+      )}
 
-      {/* ---- slot panel: state at the playhead, not final state ---- */}
+      {view === "timeline" && (
       <footer className="slots">
         {SLOT_KEYS.map((k) => {
           const past = model.slotChanges.filter((s) => s.key === k && seen(s.t));
@@ -290,7 +500,7 @@ function App() {
           const flash = cur && cur.t > 0 && playhead - cur.t < 0.9 && playhead < model.tEnd;
           return (
             <div key={k} className={"slot" + (flash ? " flash" : "")}>
-              <span className="slot-key">{k}</span>
+              <span className="slot-key">{SLOT_NAMES[k]}</span>
               <span className="slot-val mono">
                 {cur === null ? "—" : flash && flipped ? (
                   <>
@@ -304,6 +514,7 @@ function App() {
           );
         })}
       </footer>
+      )}
     </div>
   );
 }

@@ -7,9 +7,11 @@ when it lands; agent.py does not change.
     python harness.py            # run all scenarios, print traces + score
     python harness.py -q         # score only
     python harness.py --telemetry   # per-scenario latency/cancels/tokens -> telemetry.csv
-    python harness.py --export-trace PATH   # flagship scenario's trace for the visualiser
+    python harness.py --export-trace PATH   # every scenario (name/blurb/score/trace) for
+                                            # the visualiser; flagship kept at top level
 """
 
+import hashlib
 import heapq
 import json
 import sys
@@ -59,6 +61,7 @@ def run_tool(tool: str, args: dict, attempt: int, faults: set) -> dict:
 SCENARIOS = [
     {
         "name": "mid-utterance destination change",
+        "blurb": "The user changes destination mid-sentence; only the stale search is thrown away, everything else keeps running.",
         "multimodal": False,
         "faults": set(),
         "events": [
@@ -74,6 +77,7 @@ SCENARIOS = [
     },
     {
         "name": "duplicate booking guard",
+        "blurb": "Asked to book the same flight twice, it refuses the second time.",
         "multimodal": False,
         "faults": set(),
         "events": [
@@ -89,6 +93,7 @@ SCENARIOS = [
     },
     {
         "name": "missing slot -> clarify, never guess",
+        "blurb": "Told to book with no departure city given, it asks instead of guessing.",
         "multimodal": False,
         "faults": set(),
         "events": [
@@ -100,6 +105,7 @@ SCENARIOS = [
     },
     {
         "name": "read-only retry after injected fault",
+        "blurb": "The flight search fails once upstream; it quietly retries and recovers without bothering the user.",
         "multimodal": False,
         "faults": {"search_flights"},
         "events": [
@@ -112,6 +118,7 @@ SCENARIOS = [
     },
     {
         "name": "multimodal: frame grounding behind an acknowledgment",
+        "blurb": "Shown a boarding pass on camera, it says something first, then fills in the trip from the image.",
         "multimodal": True,
         "faults": set(),
         "events": [
@@ -129,6 +136,7 @@ SCENARIOS = [
         # counter is satisfied by then; only per-slot dwell + a grace window
         # can hold the booking back until the destination stops moving.
         "name": "correction lands after the commit word",
+        "blurb": "The correction arrives moments after 'book it' - a short grace window means the wrong flight is never bought.",
         "multimodal": False,
         "faults": set(),
         "events": [
@@ -150,6 +158,7 @@ SCENARIOS = [
         # slots, so slot-name reads alone cannot see that the seat belongs to
         # a flight that no longer matches the user's destination.
         "name": "derived args: seat from a superseded flight",
+        "blurb": "A seat found on the old flight is never booked: dropping the search also drops everything built on it.",
         "multimodal": False,
         "faults": set(),
         "events": [
@@ -175,6 +184,7 @@ SCENARIOS = [
         # the correction is applied first and the stale result is dropped as
         # cancelled rather than being read at all.
         "name": "interrupt lands at the exact instant a tool returns",
+        "blurb": "A correction and a tool result arrive at the very same instant; the correction wins, the stale result is never read.",
         "multimodal": False,
         "faults": set(),
         "events": [
@@ -194,6 +204,7 @@ SCENARIOS = [
         # a completed booking (it's already real, un-bookable) but it must still
         # be treated as a live instruction, not dropped on the floor.
         "name": "correction arrives after the final marker",
+        "blurb": "The user corrects AFTER hearing 'you're booked' - it books the new flight and openly flags the old booking instead of hiding it.",
         "multimodal": False,
         "faults": set(),
         "events": [
@@ -214,6 +225,7 @@ SCENARIOS = [
         # both hops must cancel cleanly, and hitting REVISION_CAP on the same
         # slot must escalate to a confirm rather than booking on a guess.
         "name": "rapid double correction escalates to a confirm",
+        "blurb": "Corrected twice within 20ms, it stops guessing and asks which destination the user actually meant.",
         "multimodal": False,
         "faults": set(),
         "events": [
@@ -466,14 +478,33 @@ def telemetry_table(write_csv=True) -> list[dict]:
     return rows
 
 
+def export_payload() -> dict:
+    """Every scenario, in SCENARIOS order, each with its name, blurb,
+    multimodal flag, score and full trace. The flagship's name and trace stay
+    at the top level under the original "scenario"/"trace" keys - an additive
+    superset, so an existing reader of the single-scenario shape (the
+    visualiser reads data.trace from a static file and cannot pass a flag)
+    keeps working unchanged."""
+    entries = []
+    for scn in SCENARIOS:
+        run = simulate(scn)
+        pts, _ = score(scn, run)
+        entries.append({"name": scn["name"], "blurb": scn["blurb"],
+                        "multimodal": scn["multimodal"], "score": pts,
+                        "trace": run["trace"]})
+    return {"scenario": entries[0]["name"], "trace": entries[0]["trace"],
+            "scenarios": entries}
+
+
 def export_trace(path):
-    """Write the flagship scenario's trace in the shape the visualiser fetches
-    ({"trace": [...]}). The sim is deterministic, so a judge's run produces the
-    same trace every time - the UI then shows their run, not a committed file."""
-    run = simulate(SCENARIOS[0])
-    with open(path, "w") as f:
-        json.dump({"scenario": SCENARIOS[0]["name"], "trace": run["trace"]}, f, indent=2)
-    print(f"wrote {path} ({SCENARIOS[0]['name']})")
+    """Write the full export where the visualiser serves it. The sim is
+    deterministic, so a judge's run produces byte-identical output every time
+    (newline="\\n" keeps Windows and container writes identical too)."""
+    payload = export_payload()
+    with open(path, "w", newline="\n") as f:
+        json.dump(payload, f, indent=2)
+    print(f"wrote {path} ({len(payload['scenarios'])} scenarios; "
+          f"top-level trace: {payload['scenario']})")
 
 
 def main(quiet=False):
@@ -498,6 +529,10 @@ def main(quiet=False):
             print()
     print(f"\n{'mean':>8}: {sum(totals)/len(totals):.1f} / 100   over {len(totals)} scenarios")
     return totals
+
+
+# sha256 of the serialized export - see the determinism pin in _selfcheck
+EXPORT_DIGEST = "197292b9d504b6f40dd5838ad9af23b221df962010b420fc8d11d8a6ce4c2549"
 
 
 def _selfcheck():
@@ -622,6 +657,19 @@ def _selfcheck():
     refs = [e["result"]["booking_ref"] for e in payload["trace"]
             if e.get("kind") == "tool_result" and e["result"].get("booking_ref")]
     assert refs == ["PNR7240"], f"booking_ref not deterministic across processes: {refs}"
+
+    # the full export: ordered like SCENARIOS, blurbed, scored, and the
+    # flagship duplicated at the top level for existing readers
+    exp = export_payload()
+    assert [e["name"] for e in exp["scenarios"]] == [s["name"] for s in SCENARIOS]
+    assert exp["scenario"] == SCENARIOS[0]["name"] and exp["trace"] == exp["scenarios"][0]["trace"]
+    assert all(e["blurb"] and e["score"] == 100.0 and e["trace"] for e in exp["scenarios"])
+    # determinism pin: this literal digest only keeps matching if the export
+    # is byte-identical across processes. If you changed a scenario or blurb
+    # on purpose, rerun and update the literal; if you changed nothing and
+    # this fails, you introduced nondeterminism.
+    digest = hashlib.sha256(json.dumps(exp, indent=2).encode()).hexdigest()
+    assert digest == EXPORT_DIGEST, f"export digest drifted: {digest}"
 
     # ticks are an optimisation, not a requirement: a replayed event stream
     # with no timer support must still complete every booking at full score
