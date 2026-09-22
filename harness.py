@@ -14,6 +14,7 @@ when it lands; agent.py does not change.
 import hashlib
 import heapq
 import json
+import os
 import sys
 
 from agent import Agent, CALL, CANCEL, CLARIFY, FINAL, SAY, _idem
@@ -537,6 +538,9 @@ EXPORT_DIGEST = "197292b9d504b6f40dd5838ad9af23b221df962010b420fc8d11d8a6ce4c254
 
 def _selfcheck():
     """Smallest thing that fails if the coordinator breaks."""
+    # determinism is only meaningful offline: no LLM variable may be live here
+    assert not any(os.getenv(k) for k in _LLM_ENV), \
+        "selfcheck must run hermetic - LLM env vars should have been bypassed"
     run = simulate(SCENARIOS[0])
     cancels = [e for e in run["trace"] if e["dir"] == "out" and e["kind"] == CANCEL]
     assert len(cancels) == 1, f"expected 1 cancel, got {len(cancels)}"
@@ -705,7 +709,23 @@ def _selfcheck():
     print("selfcheck ok")
 
 
+# Scored runs are hermetic by contract: an exported API key would route
+# extraction through a live LLM and silently break identical-trace replay.
+# Scrubbed only when harness.py runs as a script - importing this module
+# (the demo, an adapter) leaves the environment alone, and perception.py's
+# own behaviour when called directly is unchanged.
+_LLM_ENV = ("AURA_LLM_URL", "OPENAI_API_KEY", "GEMINI_API_KEY", "AURA_VLM_URL")
+
+
+def _force_hermetic():
+    bypassed = [k for k in _LLM_ENV if os.environ.pop(k, None) is not None]
+    if bypassed:
+        print(f"hermetic run: ignoring {', '.join(bypassed)} - "
+              "scored runs always use the deterministic extractor")
+
+
 if __name__ == "__main__":
+    _force_hermetic()
     if "--selfcheck" in sys.argv:
         _selfcheck()
     elif "--telemetry" in sys.argv:

@@ -68,11 +68,16 @@ The UI and the scorer consume the action stream. Neither reads `agent.py`.
 
 ## Known placeholders
 
-- `_extract` is a keyword matcher. Swap for an LLM call, same return type.
 - The scorer implements the published rubric from our reading of the spec. It is
   not Samsung's scorer. Scoring 100 means the agent behaves as designed, nothing more.
 
-(Formerly listed here, now implemented: per-slot stability is
+Extraction is no longer a placeholder: the primary path is `perception.extract`
+(LLM when an API key is configured, its own deterministic fallback otherwise),
+behind a guarded import in `agent.py` — `agent._extract` remains only as the
+last-resort keyword fallback if that import fails. Scored harness runs scrub
+the LLM env vars and always take the deterministic path.
+
+(Also formerly listed here, now implemented: per-slot stability is
 `SlotMeta(last_changed_at, revision_count)` with repair cues, grace-window
 deferral, and escalation capped at one step before routing to Clarify — never
 scale dwell exponentially, it starves the least certain users. Chained calls

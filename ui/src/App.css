@@ -236,12 +236,13 @@ body {
   stroke: var(--faint);
   stroke-width: 1;
   vector-effect: non-scaling-stroke;
-  opacity: 0.4;
+  opacity: 0.6;
   transition: stroke 0.35s, opacity 0.35s;
 }
-.wire.derived { stroke-dasharray: 4 4; opacity: 0.25; }
+.wire.derived { stroke-dasharray: 4 4; opacity: 0.35; }
 .wire.red { stroke: var(--red); stroke-width: 2; opacity: 0.95; }
-.wire.ghost { opacity: 0.1; }
+/* after the cancellation stops being the subject: still traceable, no alarm */
+.wire.cooled { stroke: var(--red); opacity: 0.25; }
 
 .node {
   position: absolute;

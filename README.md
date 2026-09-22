@@ -107,13 +107,26 @@ stream with no timer support is still correct (`--selfcheck` asserts this).
 Then replace `MANIFEST`, `run_tool` and `SCENARIOS` in `harness.py` with theirs
 and delete the local scorer in favour of the real one.
 
+## Extraction
+
+- Slot extraction goes through `perception.extract(event)`: an LLM call when
+  `AURA_LLM_URL` / `OPENAI_API_KEY` / `GEMINI_API_KEY` is configured, and a
+  deterministic keyword fallback otherwise. `agent.py` guards the import, so
+  the core stays pure-stdlib and still works if `perception.py` is absent
+  (its own internal fallback takes over, same contract).
+- Scored harness runs are hermetic: `python harness.py` (all entry points)
+  ignores those variables for the duration of the run and prints a line when
+  one was bypassed, so the identical-trace claim holds for everyone.
+- `python demo_llm_extract.py` is a standalone, stdlib-only demonstration
+  with a mocked LLM: a correction the keyword matcher can't parse ("actually
+  let's do Goa instead") moves the destination slot and cancels the stale
+  search. Illustrative only - deliberately not part of `--selfcheck`.
+- The harness scenarios feed pre-captioned frames; `perception.extract` also
+  accepts raw WAV (faster-whisper) and PNG (VLM captioning) when those
+  optional extras are configured.
+
 ## Stubbed, deliberately
 
-- `_extract` is a keyword matcher, not an LLM. Deterministic, so the harness
-  stays reproducible. Swap it for one LLM call returning the same `{slot: value}`
-  dict; nothing else changes.
-- Audio and frames arrive pre-captioned. Real ASR/VLM goes behind the same
-  acknowledgment-first path that's already wired in `_on_perception`.
 - The scorer implements the published rubric (40/35/15/10) from my reading of the
   spec. **It is not the real scorer.** Scoring 100 here means the agent behaves as
   designed, nothing more.

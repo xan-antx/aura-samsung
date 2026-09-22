@@ -17,6 +17,16 @@ import hashlib
 import json
 from dataclasses import dataclass, field
 
+# Perception is the ML boundary (LLM slot extraction, ASR, VLM). The guarded
+# import keeps this file pure-stdlib and self-sufficient: if perception.py is
+# missing or broken, the keyword fallback below takes over, and with no API
+# key configured perception itself degrades to the same deterministic
+# extractor - so the harness stays reproducible either way.
+try:
+    from perception import extract as _perception_extract
+except Exception:
+    _perception_extract = None
+
 # --- protocol -------------------------------------------------------------
 
 SAY, CALL, CANCEL, CLARIFY, FINAL = "say", "call", "cancel", "clarify", "final"
@@ -70,9 +80,9 @@ def _idem(tool: str, args: dict) -> str:
 CITIES = {"delhi", "mumbai", "bengaluru", "bangalore", "chennai", "goa", "pune"}
 _ALIAS = {"bangalore": "bengaluru"}
 
-# ponytail: keyword extractor, deterministic and zero-dependency so the harness
-# stays reproducible. Upgrade path: swap _extract for one LLM call returning the
-# same {slot: value} dict. Nothing else in this file changes.
+# Keyword extractor: the last-resort fallback when perception.py cannot even
+# be imported. Deterministic and zero-dependency, mirrored by perception's own
+# internal fallback, so all three paths honour the same contract.
 def _extract(text: str) -> dict:
     t = text.lower()
     out = {}
@@ -97,6 +107,15 @@ def _extract(text: str) -> dict:
     if "book" in t or "confirm" in t:
         out["commit"] = True
     return out
+
+
+def _sense(ev: dict) -> dict:
+    """The extract(event) -> dict boundary: perception when importable, the
+    local keyword matcher when not. Same contract both ways - a partial slot
+    dict, {} on any failure, never raises, synchronous."""
+    if _perception_extract is not None:
+        return _perception_extract(ev)
+    return _extract(ev.get("text") or ev.get("caption") or "")
 
 
 REPAIR_CUES = {"actually", "wait", "sorry", "no"}
@@ -178,7 +197,7 @@ class Agent:
         text = ev.get("text", "")
         if _repair_cue(text):
             self.repair_cue_at = now               # freeze mutations: correction incoming
-        changed = self._apply(_extract(text), now)
+        changed = self._apply(_sense(ev), now)
         acts = self._invalidate(changed, now)          # cancel stale work FIRST
         acts += self._plan(now)
         if ev.get("final"):
@@ -196,7 +215,7 @@ class Agent:
         if now - self.last_spoke > self.FILLER_GAP:
             acts.append(self._say("Let me take a look at that.", now))
         self.pending_perception += 1
-        changed = self._apply(_extract(ev.get("caption", "")), now)
+        changed = self._apply(_sense(ev), now)
         acts += self._invalidate(changed, now)
         acts += self._plan(now)
         self.pending_perception -= 1

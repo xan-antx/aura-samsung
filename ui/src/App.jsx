@@ -375,14 +375,22 @@ function App() {
               {tree.edges.map((e, i) => {
                 const a = tree.pos[e.from];
                 const b = tree.pos[e.to];
-                if (!a || !b) return null;
                 const c = e.call;
+                // no wires to calls that don't exist yet: ghost nodes keep
+                // the structure visible, but their edges must not compete
+                // with the live ones
+                if (!a || !b || !seen(c.start)) return null;
                 const dead = c.cancelled && seen(c.cancelT);
+                // the kill edge burns red while the cancellation is the
+                // current subject, then settles: the closing frame is about
+                // the booking that resolved, not the call that died
+                const hot = dead && playhead - c.cancelT < 1.2;
                 const cls =
                   "wire" +
                   (e.derived ? " derived" : "") +
-                  (!e.derived && dead && c.by.includes(e.slot) ? " red" : "") +
-                  (seen(c.start) ? "" : " ghost");
+                  (!e.derived && dead && c.by.includes(e.slot)
+                    ? hot ? " red" : " cooled"
+                    : "");
                 return <line key={i} className={cls} x1={a.x} y1={a.y} x2={b.x} y2={b.y} />;
               })}
             </svg>
