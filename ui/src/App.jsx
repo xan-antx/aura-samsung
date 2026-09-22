@@ -368,7 +368,18 @@ function App() {
         </div>
       </section>
 
-      {view === "tree" && (
+      {view === "tree" && (() => {
+        // per-slot state at the playhead, shared by nodes and edge anchors
+        const slotState = {};
+        SLOT_KEYS.forEach((k) => {
+          const past = model.slotChanges.filter((s) => s.key === k && seen(s.t));
+          slotState[k] = {
+            cur: past.length ? past[past.length - 1] : null,
+            prev: past.length > 1 ? past[past.length - 2] : null,
+          };
+        });
+        const ANCHOR = 2.4; // % of graph height: stale row above, current below
+        return (
         <main className="treewrap">
           <div className="graph">
             <svg className="wires" viewBox="0 0 100 100" preserveAspectRatio="none">
@@ -392,18 +403,22 @@ function App() {
                 const quiet = dead
                   ? playhead - c.cancelT >= HOT
                   : c.result && seen(c.end) && playhead - c.end >= HOT;
+                const kill = !e.derived && dead && c.by.includes(e.slot);
                 const cls =
                   "wire" +
                   (e.derived ? " derived" : "") +
-                  (!e.derived && dead && c.by.includes(e.slot)
-                    ? hot ? " red" : " cooled"
-                    : quiet ? " quiet" : "");
-                return <line key={i} className={cls} x1={a.x} y1={a.y} x2={b.x} y2={b.y} />;
+                  (kill ? (hot ? " red" : " cooled") : quiet ? " quiet" : "");
+                // causal routing: once a slot has changed, the kill edge
+                // leaves from the struck stale row, live edges from the
+                // current-value row - dead value -> dead call, live -> live
+                let y1 = a.y;
+                if (!e.derived && slotState[e.slot]?.prev)
+                  y1 = a.y + (kill ? -ANCHOR : ANCHOR);
+                return <line key={i} className={cls} x1={a.x} y1={y1} x2={b.x} y2={b.y} />;
               })}
             </svg>
             {SLOT_KEYS.map((k) => {
-              const past = model.slotChanges.filter((s) => s.key === k && seen(s.t));
-              const cur = past.length ? past[past.length - 1] : null;
+              const { cur, prev } = slotState[k];
               const flash = cur && cur.t > 0 && playhead - cur.t < 0.9 && playhead < model.tEnd;
               const p = tree.pos[k];
               return (
@@ -413,6 +428,11 @@ function App() {
                   style={{ left: `${p.x}%`, top: `${p.y}%` }}
                 >
                   <span className="node-key">{SLOT_NAMES[k]}</span>
+                  {prev && (
+                    <span className="node-stale mono">
+                      <s>{String(prev.value)}</s>
+                    </span>
+                  )}
                   <span className="node-val mono">{cur === null ? "—" : String(cur.value)}</span>
                 </div>
               );
@@ -427,8 +447,10 @@ function App() {
                 "node callnode" +
                 (seen(c.start) ? "" : " ghost") +
                 (dead ? " killed" : stale ? " stale" : finished ? " done" : running ? " running" : "");
+              const glyph = dead ? "✕" : stale ? "!" : finished ? "✓" : running ? "▶" : "○";
               return (
                 <div key={c.id} className={cls} style={{ left: `${p.x}%`, top: `${p.y}%` }}>
+                  <i className="stat mono">{glyph}</i>
                   <span className="node-title">{cardTitle(c)}</span>
                   {dead ? (
                     <span className="node-status red-text">
@@ -449,7 +471,8 @@ function App() {
             })}
           </div>
         </main>
-      )}
+        );
+      })()}
 
       {view === "timeline" && (
       <main className="panels">

@@ -11,6 +11,7 @@
   --hairline: #1e2126;
   --accent: #58a6ff;
   --red: #f0564a;           /* cancellation, and only cancellation */
+  --amber: #d29922;         /* superseded: completed, but the user moved on */
   --mono: "SF Mono", ui-monospace, Menlo, Consolas, monospace;
 }
 
@@ -269,23 +270,34 @@ body {
   letter-spacing: 1px;
 }
 .node-val { display: block; font-size: 15px; margin-top: 3px; }
-.slotnode.flash { background: rgba(88, 166, 255, 0.14); }
+/* the dead value, kept visible above the live one: kill edges leave from it */
+.node-stale { display: block; font-size: 13px; color: var(--faint); margin-top: 3px; }
+.node-stale s { text-decoration-color: var(--red); }
+.slotnode.flash { background: #1d2939; }  /* opaque: wires must not show through */
 .slotnode.flash .node-val { color: var(--accent); }
 
-.callnode { min-width: 220px; }
+.callnode { min-width: 220px; padding-left: 24px; padding-right: 24px; }
+/* small monochrome status glyph; colour stays the primary encoding */
+.stat {
+  position: absolute; top: 5px; right: 7px;
+  font-style: normal;
+  font-size: 11px;
+  color: var(--faint);
+}
 .node-title { display: block; font-size: 14.5px; font-weight: 600; white-space: nowrap; }
 .node-status { display: block; font-size: 14px; color: var(--dim); margin-top: 4px; }
 .callnode.running { border-color: var(--accent); }
 .callnode.killed { border-color: rgba(240, 86, 74, 0.6); }
 .callnode.killed .node-title { text-decoration: line-through; text-decoration-color: var(--red); }
 .red-text { color: var(--red); }
-/* superseded completed mutation: dimmed, NOT struck - it was not cancelled */
-.callnode.stale { opacity: 0.6; }
+/* superseded completed mutation: a third state - neither cancelled nor
+   ordinary-completed. Amber border, dimmed, NOT struck. */
+.callnode.stale { opacity: 0.65; border-color: var(--amber); }
 .still {
   margin-left: 8px;
   font-size: 10px;
-  color: var(--ink);
-  border: 1px solid var(--faint);
+  color: var(--amber);
+  border: 1px solid var(--amber);
   border-radius: 3px;
   padding: 1px 5px;
   vertical-align: 1px;
