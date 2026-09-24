@@ -348,6 +348,82 @@ SCENARIOS = [
                              "date": "2026-09-15", "commit": True},
                    "called_with": [("cancel_booking", {"booking_ref": "PNR5797"})]},
     },
+    {
+        # Off-topic mid-session: the reply is capability + current state,
+        # never a re-emission of the previous final.
+        "name": "weather question after a booking states capability",
+        "blurb": "Asked about the weather after booking, it says what it can do and restates the booking in one line - it never replays its last answer.",
+        "multimodal": False,
+        "faults": set(),
+        "events": [
+            (0.0, {"kind": "chunk", "text": "flight from Delhi to Goa tomorrow", "final": True}),
+            (2.0, {"kind": "chunk", "text": "yes please", "final": True}),
+            (6.0, {"kind": "chunk", "text": "what's the weather in Goa?", "final": True}),
+        ],
+        "expect": {"tools_ok": {"search_flights", "check_seat_availability", "book_flight"},
+                   "cancels": 0,
+                   "slots": {"origin": "delhi", "destination": "goa",
+                             "date": "2026-09-15", "commit": True},
+                   "called_with": [("book_flight", {"flight_id": "GOA-101"})]},
+    },
+    {
+        # The dangerous variant: the weather question names ANOTHER city.
+        # Grounding alone would keep it - the topic gate must stop it from
+        # moving the destination, starting a search, or superseding anything.
+        "name": "weather in another city must not reroute the booking",
+        "blurb": "Asking about the weather in Pune does not change the destination, start a search, or touch the Goa booking - a question is not a correction.",
+        "multimodal": False,
+        "faults": set(),
+        "events": [
+            (0.0, {"kind": "chunk", "text": "flight from Delhi to Goa tomorrow", "final": True}),
+            (2.0, {"kind": "chunk", "text": "yes please", "final": True}),
+            (6.0, {"kind": "chunk", "text": "what's the weather in Pune?", "final": True}),
+        ],
+        "expect": {"tools_ok": {"search_flights", "check_seat_availability", "book_flight"},
+                   "cancels": 0,
+                   "slots": {"origin": "delhi", "destination": "goa",
+                             "date": "2026-09-15", "commit": True},
+                   "called_with": [("book_flight", {"flight_id": "GOA-101"})],
+                   "never_called_with": [("search_flights", {"destination": "pune"})]},
+    },
+    {
+        # An off-topic turn must not deafen the agent: the next on-topic
+        # correction still lands and re-plans normally.
+        "name": "correction still works after an off-topic turn",
+        "blurb": "An off-topic question in the middle changes nothing - the very next correction still moves the search to the new city.",
+        "multimodal": False,
+        "faults": set(),
+        "events": [
+            (0.0, {"kind": "chunk", "text": "flight from Delhi to Goa tomorrow", "final": True}),
+            (2.0, {"kind": "chunk", "text": "what's the weather in Goa?", "final": True}),
+            (4.0, {"kind": "chunk", "text": "actually make it to Pune", "final": True}),
+        ],
+        "expect": {"tools_ok": {"search_flights", "check_seat_availability"},
+                   "cancels": 0,
+                   "slots": {"origin": "delhi", "destination": "pune",
+                             "date": "2026-09-15"},
+                   "called_with": [("search_flights", {"destination": "pune"})],
+                   "never_called_with": [("book_flight", {})]},
+    },
+    {
+        # "book me a hotel too" carries the commit verb, but the hotel noun
+        # makes the turn off-topic: no flight is booked on it, and the open
+        # book offer is still answerable with a plain "yes" afterwards.
+        "name": "hotel request books no flight; the offer survives",
+        "blurb": "Asked to book a hotel, it books nothing and says so - and the flight offer is still there to accept with a plain 'yes'.",
+        "multimodal": False,
+        "faults": set(),
+        "events": [
+            (0.0, {"kind": "chunk", "text": "flight from Delhi to Goa tomorrow", "final": True}),
+            (3.0, {"kind": "chunk", "text": "can you book me a hotel too?", "final": True}),
+            (5.0, {"kind": "chunk", "text": "yes", "final": True}),
+        ],
+        "expect": {"tools_ok": {"search_flights", "check_seat_availability", "book_flight"},
+                   "cancels": 0,
+                   "slots": {"origin": "delhi", "destination": "goa",
+                             "date": "2026-09-15", "commit": True},
+                   "called_with": [("book_flight", {"flight_id": "GOA-101"})]},
+    },
 ]
 
 # --- known gap, not fixed here (out of scope for harness.py) ----------------
@@ -648,10 +724,11 @@ def main(quiet=False):
 
 
 # sha256 of the serialized export - see the determinism pin in _selfcheck.
-# Updated deliberately 2026-09-24 (second time): pending-question answers
-# ("yes"/"no" resolve the agent's own offers) and the real cancel_booking
-# tool added four scenarios.
-EXPORT_DIGEST = "f6bc72eaf5deabb880d753a31f1df989f28af9684aa665e6e75899432ccffddf"
+# Updated deliberately 2026-09-24 (fifth time): stage-specific narration
+# ("Searching flights Delhi to Goa...") and named corrections ("Got it - Goa
+# instead of Mumbai.") change SAY text across most traces. ASCII only, so
+# every trace line prints on a cp1252 Windows console.
+EXPORT_DIGEST = "9cebedef7fc6c9111c18ba534731e8a0eeba02f07397fc3f9c7e2d1e02ba4d06"
 
 
 def _selfcheck():
@@ -878,6 +955,62 @@ def _selfcheck():
             "with a question open, the LLM-mode yes must still execute the offer"
     finally:
         _agent_mod._perception_extract = _prev_extract
+
+    # off-topic turns: capability + state in one line, nothing applied,
+    # nothing resolved, never a repeat of the previous final
+    wgoa = simulate(SCENARIOS[16])
+    finals = [o["text"] for o in _out(wgoa, FINAL)]
+    assert "only help with flights" in finals[-1] and "GOA-101" in finals[-1], finals[-1]
+    assert finals[-1] != finals[-2], "off-topic reply must not repeat the previous final"
+    wpune = simulate(SCENARIOS[17])
+    assert wpune["snapshot"]["slots"]["destination"] == "goa", \
+        "a weather question naming Pune must not move the destination"
+    assert not [c for c in _out(wpune, CALL, "search_flights")
+                if c["args"]["destination"] == "pune"]
+    assert "still active" not in _out(wpune, FINAL)[-1]["text"], \
+        "nothing may be disclosed as superseded by a weather question"
+    # a pending offer survives an off-topic turn and is still answerable
+    surv = simulate({"name": "offer survives weather", "multimodal": False, "faults": set(),
+        "events": [(0.0, {"kind": "chunk", "text": "flight from Delhi to Goa tomorrow", "final": True}),
+                   (2.0, {"kind": "chunk", "text": "what's the weather in Goa?", "final": True}),
+                   (3.0, {"kind": "chunk", "text": "yes please", "final": True})]})
+    books = _out(surv, CALL, "book_flight")
+    assert len(books) == 1 and books[0]["args"]["flight_id"] == "GOA-101", \
+        "the book offer must survive an off-topic turn"
+
+    # stage-specific narration + named corrections: fillers say what is
+    # happening, and a correction is named even when nothing was in flight
+    from agent import _narrate
+    assert _narrate("check_seat_availability", {"flight_id": "GOA-101"}) == "Checking seats on GOA-101..."
+    assert _narrate("book_flight", {"flight_id": "GOA-101"}) == "Booking GOA-101..."
+    assert _narrate("cancel_booking", {"booking_ref": "PNR1"}) == "Cancelling booking PNR1..."
+    says = [e["text"] for e in simulate(SCENARIOS[0])["trace"]
+            if e["dir"] == "out" and e["kind"] == SAY]
+    assert any(s.startswith("Searching flights Delhi to Mumbai") for s in says), says
+    # every spoken line must survive a cp1252 Windows console
+    for s in says:
+        s.encode("cp1252")
+    assert any("Goa instead of Mumbai" in s for s in says), says
+    assert "One moment, checking that now." not in says, says
+    # scenario 6's correction lands after the old search already finished:
+    # nothing is cancelled, but the correction is still named out loud
+    late_says = [e["text"] for e in simulate(SCENARIOS[5])["trace"]
+                 if e["dir"] == "out" and e["kind"] == SAY]
+    assert any("Goa instead of Mumbai" in s for s in late_says), late_says
+
+    # "book me a hotel too": the commit verb must not book the flight - the
+    # booking fires only after the explicit "yes", through the normal grace
+    # window, and the off-topic turn was answered with a capability line
+    hotel = simulate(SCENARIOS[19])
+    books = _out(hotel, CALL, "book_flight")
+    assert len(books) == 1 and books[0]["t"] >= 5.0 + Agent.GRACE - 1e-9, \
+        f"'book me a hotel' must not book the flight: {books}"
+    offf = [o for o in _out(hotel, FINAL) if o.get("off_topic")]
+    assert offf and "only help with flights" in offf[0]["text"], offf
+    # ...while an explicit flight in the same breath stays on-topic
+    from agent import _extract as _agent_extract
+    assert _agent_extract("book a flight and a hotel").get("topic") != "other"
+    assert _agent_extract("can you book me a hotel too?").get("topic") == "other"
 
     # slot grounding: a model can never introduce a value the user didn't say.
     # Reproduces the observed Groq hallucination - origin "bengaluru" invented

@@ -106,7 +106,18 @@ def _extract(text: str) -> dict:
         out["intent"] = "flight"
     if "book" in t or "confirm" in t:
         out["commit"] = True
+    if OFF_TOPIC_WORDS & set(words) and "flight" not in t and "fly" not in t:
+        out["topic"] = "other"      # this utterance is about something else
     return out
+
+
+# Turn-topic lexicon for the deterministic path: an off-topic NOUN wins over
+# a bare verb - "book me a hotel" is about the hotel, and must neither book
+# a flight nor resolve a pending offer. Only an explicit "flight"/"fly" in
+# the same utterance keeps it on-topic ("book a flight and a hotel").
+# Mirrored in perception._fallback_extract - keep the two in sync.
+OFF_TOPIC_WORDS = {"weather", "hotel", "taxi", "cab", "train", "restaurant",
+                   "table", "food", "pizza", "news", "movie", "music", "shopping"}
 
 
 def _sense(ev: dict) -> dict:
@@ -164,6 +175,22 @@ def _affirmative(text: str) -> bool:
     return bool(words) and (words[0] in _AFFIRM or _phrase_in(words, _AFFIRM_PHRASES))
 
 
+def _narrate(tool: str, args: dict) -> str:
+    """Stage-specific narration: the filler says what is actually happening.
+    Progress only - never a completion claim (rule 2). ASCII only: judges'
+    consoles (Windows cp1252) must be able to print every trace line."""
+    if tool == "search_flights":
+        return (f"Searching flights {str(args.get('origin', '')).title()} to "
+                f"{str(args.get('destination', '')).title()}...")
+    if tool == "check_seat_availability":
+        return f"Checking seats on {args.get('flight_id')}..."
+    if tool == "book_flight":
+        return f"Booking {args.get('flight_id')}..."
+    if tool == "cancel_booking":
+        return f"Cancelling booking {args.get('booking_ref')}..."
+    return "One moment, checking that now."
+
+
 REPAIR_CUES = {"actually", "wait", "sorry", "no"}
 
 
@@ -206,6 +233,7 @@ class Agent:
                                                 # |"cancel", ...}. One at a time.
         self.declined: set[str] = set()         # question signatures never re-asked
         self.cancel_approved: dict | None = None  # affirmed cancel offer awaiting execution
+        self.flips: list = []                   # (slot, old, new) replacements this turn
         self.pending_perception = 0
         self._n = 0
 
@@ -245,15 +273,59 @@ class Agent:
 
     def _on_chunk(self, ev, now) -> list[Action]:
         text = ev.get("text", "")
+        extracted = self._gate_commit(_sense(ev), text)
+        if extracted.pop("topic", None) == "other":
+            return self._off_topic(ev, now)        # nothing applies, nothing resolves
         if _repair_cue(text):
             self.repair_cue_at = now               # freeze mutations: correction incoming
-        changed = self._apply(self._gate_commit(_sense(ev), text), now)
+        changed = self._apply(extracted, now)
         acts = self._invalidate(changed, now)          # cancel stale work FIRST
         acts += self._answer(changed, text, now)       # then resolve the pending question
         acts += self._plan(now)
         if ev.get("final"):
             acts += self._finalise(now)
         return acts
+
+    OFF_TOPIC_REPLY = "I can only help with flights."
+
+    def _off_topic(self, ev, now: float) -> list[Action]:
+        """A turn about something else entirely. No slot is applied - even a
+        city named inside a weather question - no pending question resolves,
+        and no work is re-planned. The reply is capability plus current state
+        in one line, never a repeat of the previous final."""
+        if not ev.get("final"):
+            if now - self.last_spoke > self.FILLER_GAP:
+                return [self._say(self.OFF_TOPIC_REPLY, now)]
+            return []
+        if not self.done and not self.inflight and self.wake_at is None \
+                and not self.slots.get("destination"):
+            # empty session: byte-identical to the cold out-of-domain ask
+            return [Action(CLARIFY, now, {
+                "text": "I can search for and book flights - that's all I do. "
+                        "Where would you like to fly?",
+                "missing": ["destination"], "state": self.snapshot()})]
+        bookings = [c for c in self.done.values()
+                    if c.mutating and c.result.get("ok") and c.result.get("booking_ref")]
+        cancelled_refs = {c.result.get("cancelled") for c in self.done.values()
+                          if c.tool == "cancel_booking" and c.result.get("ok")}
+        live = [c for c in bookings if c.result["booking_ref"] not in cancelled_refs]
+        current = [c for c in live if not c.superseded]
+        if current:
+            b = max(current, key=lambda c: c.issued_at)
+            state = (f"Your booking on {b.args['flight_id']} is confirmed "
+                     f"(ref {b.result['booking_ref']}).")
+        elif self.inflight or self.wake_at is not None:
+            state = "I'm still working on your flight."
+        else:
+            state = (f"Your {self.slots.get('destination', 'flight')} search "
+                     "results are ready when you are.")
+        for c in live:
+            if c.superseded:                       # rule 2 discipline holds here too
+                state += (f" Your earlier booking {c.args['flight_id']} "
+                          f"(ref {c.result['booking_ref']}) is still active.")
+        return [Action(FINAL, now, {"text": f"{self.OFF_TOPIC_REPLY} {state}",
+                                    "state": self.snapshot(),
+                                    "booked": bool(current), "off_topic": True})]
 
     def _gate_commit(self, extracted: dict, text: str) -> dict:
         """A commit needs evidence: an open question (whose meaning _answer
@@ -324,7 +396,9 @@ class Agent:
         if now - self.last_spoke > self.FILLER_GAP:
             acts.append(self._say("Let me take a look at that.", now))
         self.pending_perception += 1
-        changed = self._apply(self._gate_commit(_sense(ev), ev.get("caption", "")), now)
+        extracted = self._gate_commit(_sense(ev), ev.get("caption", ""))
+        extracted.pop("topic", None)     # topic is turn metadata, never a slot
+        changed = self._apply(extracted, now)
         if changed - {"commit"} and self.pending_q:
             self.pending_q = None                  # new perceived content supersedes it
         acts += self._invalidate(changed, now)
@@ -351,10 +425,16 @@ class Agent:
     # -- coordination ------------------------------------------------------
 
     def _apply(self, extracted: dict, now: float) -> set:
-        """Localised slot correction. Returns the set of slots whose value moved."""
+        """Localised slot correction. Returns the set of slots whose value moved.
+        Value REPLACEMENTS (old -> new, real slots only) are remembered in
+        self.flips so the acknowledgment can name the correction."""
         changed = set()
+        self.flips = []
         for k, v in extracted.items():
             if self.slots.get(k) != v:
+                old = self.slots.get(k)
+                if old is not None and k not in ("intent", "commit"):
+                    self.flips.append((k, old, v))
                 self.slots[k] = v
                 changed.add(k)
                 m = self.meta.get(k)
@@ -398,11 +478,18 @@ class Agent:
                     "reason": "superseded",
                     "invalidated_by": sorted(call.reads & changed),
                 }))
-        if acts:
+        if acts or self.flips:
             # Barge-in: the user talking over us cuts our current utterance. This
-            # replaces the speech in progress, it does not queue behind it.
-            acts.append(Action(SAY, now, {"text": "Got it, updating that.",
-                                          "supersedes_speech": True}))
+            # replaces the speech in progress, it does not queue behind it. A
+            # correction is NAMED whether or not anything in flight was cancelled -
+            # the old work may simply have finished already.
+            if self.flips:
+                named = ", ".join(f"{str(n).title()} instead of {str(o).title()}"
+                                  for _, o, n in self.flips[:2])
+                text = f"Got it - {named}."
+            else:
+                text = "Got it, updating that."
+            acts.append(Action(SAY, now, {"text": text, "supersedes_speech": True}))
             self.last_spoke = now
         return acts
 
@@ -524,7 +611,7 @@ class Agent:
         acts = self._issue(tool, args, reads, mutating, key, now)
         if now - self.last_spoke > self.FILLER_GAP:
             # Progress narration only. Never a completion claim - we have no result yet.
-            acts.append(self._say("One moment, checking that now.", now))
+            acts.append(self._say(_narrate(tool, args), now))
         return acts
 
     def _issue(self, tool, args, reads, mutating, key, t: float) -> list[Action]:

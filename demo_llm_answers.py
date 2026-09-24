@@ -79,6 +79,22 @@ FLOWS = [
         (2.0, {"kind": "chunk", "text": "right, change that to Goa", "final": True}),
     ], lambda calls: not any(t == "book_flight" for t, _ in calls)
                      and ("check_seat_availability", "GOA-101") in calls),
+    # a real model will likely extract destination=pune from this weather
+    # question (grounding keeps it - Pune IS in the text); the topic gate is
+    # the only thing standing between a weather question and a re-route
+    ("'weather in Pune?' after booking must not reroute", [
+        (0.0, {"kind": "chunk", "text": "flight from Delhi to Goa tomorrow", "final": True}),
+        (2.0, {"kind": "chunk", "text": "yes please", "final": True}),
+        (6.0, {"kind": "chunk", "text": "what's the weather in Pune?", "final": True}),
+    ], lambda calls: ("book_flight", "GOA-101") in calls
+                     and ("search_flights", "pune") not in calls),
+    # the commit verb rides an off-topic noun: no flight books on the hotel
+    # turn, and the open offer is still answerable with a plain "yes"
+    ("'book me a hotel too?' books nothing; offer survives", [
+        (0.0, {"kind": "chunk", "text": "flight from Delhi to Goa tomorrow", "final": True}),
+        (3.0, {"kind": "chunk", "text": "can you book me a hotel too?", "final": True}),
+        (5.0, {"kind": "chunk", "text": "yes", "final": True}),
+    ], lambda calls: calls.count(("book_flight", "GOA-101")) == 1),
 ]
 
 BOOK_OFFER = [(0.0, {"kind": "chunk", "text": "flight from Delhi to Goa tomorrow", "final": True})]
@@ -98,6 +114,14 @@ class MockLLM(BaseHTTPRequestHandler):
         elif "friday" in low:                      # prompt contract - normalize_slots
             slots["date"] = "friday"               # resolves them deterministically
         words = _clean_words(user)
+        if slots.get("topic") == "other":
+            # a real model names the city it sees, even in a weather question;
+            # grounding keeps it (the city IS in the text) - only the topic
+            # gate prevents the re-route
+            for w in words:
+                if w in {"goa", "pune", "delhi", "mumbai", "chennai", "bengaluru"}:
+                    slots["destination"] = w
+                    break
         if not slots and words and words[0] in _AFFIRM:
             slots["commit"] = True                 # ...but maps a bare affirmative to
                                                    # commit, as perception's prompt
@@ -130,7 +154,8 @@ def run(events):
 
 
 def calls_of(trace):
-    return [(e["tool"], e["args"].get("flight_id") or e["args"].get("booking_ref"))
+    return [(e["tool"], e["args"].get("flight_id") or e["args"].get("booking_ref")
+             or e["args"].get("destination"))
             for e in trace if e.get("dir") == "out" and e.get("kind") == "call"]
 
 

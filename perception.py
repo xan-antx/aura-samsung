@@ -31,7 +31,14 @@ USER_AGENT = "aura-samsung/1.0"
 
 # --- Schema and normalization constants --------------------------------------
 
-ALLOWED_SLOTS = frozenset({"origin", "destination", "date", "pax", "intent", "commit"})
+ALLOWED_SLOTS = frozenset({"origin", "destination", "date", "pax", "intent", "commit",
+                           "topic"})
+
+# Turn-topic lexicon (mirrored in agent._extract - keep in sync): an
+# off-topic NOUN wins over a bare verb like "book"; only an explicit
+# "flight"/"fly" in the same utterance keeps the turn on-topic.
+OFF_TOPIC_WORDS = {"weather", "hotel", "taxi", "cab", "train", "restaurant",
+                   "table", "food", "pizza", "news", "movie", "music", "shopping"}
 
 CITIES = {"delhi", "mumbai", "bengaluru", "bangalore", "chennai", "goa", "pune"}
 CITY_ALIASES = {"bangalore": "bengaluru"}
@@ -84,7 +91,9 @@ SYSTEM_PROMPT = (
     "compute or convert a date.\n"
     '"pax": integer passenger count.\n'
     '"intent": "flight" if about flights.\n'
-    '"commit": true only if the user confirms or asks to book.'
+    '"commit": true only if the user confirms or asks to book.\n'
+    '"topic": "flight" or "other" - what THIS utterance is about; a weather/'
+    'hotel/food/etc question is "other" even if it names a city.'
 )
 
 # --- Model Singletons and Hooks ----------------------------------------------
@@ -162,6 +171,9 @@ def normalize_slots(raw: Any, text: str = "") -> dict[str, Any]:
         elif k == "intent" and isinstance(v, str) and v.strip().lower() in ("flight", "fly"):
             out["intent"] = "flight"
 
+        elif k == "topic" and isinstance(v, str) and v.strip().lower() in ("flight", "other"):
+            out["topic"] = v.strip().lower()   # turn metadata: exempt from grounding
+
         elif k == "commit":
             if isinstance(v, bool):
                 out["commit"] = v
@@ -203,6 +215,8 @@ def _fallback_extract(text: str) -> dict[str, Any]:
         out["intent"] = "flight"
     if "book" in t or "confirm" in t:
         out["commit"] = True
+    if OFF_TOPIC_WORDS & set(words) and "flight" not in t and "fly" not in t:
+        out["topic"] = "other"
     return out
 
 
