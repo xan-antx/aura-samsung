@@ -1,31 +1,48 @@
-"""Illustrative demo: pending-question answers resolve identically whether
-extraction is the deterministic keyword matcher or an LLM that maps "yes"
-to {"commit": true} - the exact behaviour perception's system prompt asks
-its model for.
+"""Pending-question answers, verified with an LLM in front of extraction.
+
+Two modes:
+
+  python demo_llm_answers.py          # mock LLM (local, deterministic, no network)
+  python demo_llm_answers.py --real   # THE PRE-DEMO GATE against the live model
+
+Mock mode proves the mechanism: a local endpoint that extracts like the
+keyword matcher but maps a bare affirmative to {"commit": true} - exactly
+what perception's system prompt asks for - must produce action streams
+byte-identical to the deterministic path.
+
+--real runs the same flows with whatever provider is configured via
+AURA_LLM_URL, OPENAI_API_KEY or GEMINI_API_KEY (refuses to run if none is
+set). A real model may legitimately phrase extractions differently, so the
+comparison is by OUTCOME, not trace bytes: what got booked, what got
+cancelled, which questions were asked, and whether an offer was left open.
+Each user turn's real extraction is printed next to the deterministic one.
+Exit is non-zero on any outcome mismatch - run this before a live demo.
 
 Deliberately NOT part of `harness.py --selfcheck`, which stays offline and
-deterministic. Runnable standalone:
+deterministic. Stdlib only.
 
-    python demo_llm_answers.py
-
-Stdlib only. The mock LLM (OpenAI chat-completions shape, local) extracts
-like the keyword matcher, PLUS returns {"commit": true} for affirmatives -
-so "yes" comes back as content, not {}. Four flows run under both modes and
-their action streams are compared event for event:
-
-  1. "yes" to a book offer         -> books exactly the offered flight
-  2. "yes" to a slot confirmation  -> unblocks the booking
-  3. "yes" to the cancel offer     -> cancels the superseded booking
+Flows:
+  1. "yes" to a book offer           -> books exactly the offered flight
+  2. "yes" to a slot confirmation    -> unblocks the booking
+  3. "yes" to the cancel offer       -> cancels the superseded booking
   4. "book it" DURING a cancel offer -> must NOT cancel anything
+  5. "right, change that to Goa"     -> a real slot change supersedes the offer
+
+then every widened detector word ("correct", "right", "yup", "sounds good",
+"please do", "absolutely", "perfect", "that's right" / "wrong", "not now",
+"not quite") is run as the answer to a live offer.
 """
 
 import json
 import os
+import sys
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from agent import _extract, _clean_words, _AFFIRM
 from harness import simulate
+
+LLM_ENV = ("AURA_LLM_URL", "OPENAI_API_KEY", "GEMINI_API_KEY", "AURA_VLM_URL")
 
 FLOWS = [
     ("yes to a book offer", [
@@ -51,7 +68,17 @@ FLOWS = [
         (5.0, {"kind": "chunk", "text": "wait, to Goa instead", "final": True}),
         (9.0, {"kind": "chunk", "text": "book it", "final": True}),
     ], lambda calls: not any(t == "cancel_booking" for t, _ in calls)),
+    ("'right, change that to Goa' supersedes, never confirms", [
+        (0.0, {"kind": "chunk", "text": "flight from Delhi to Mumbai tomorrow", "final": True}),
+        (2.0, {"kind": "chunk", "text": "right, change that to Goa", "final": True}),
+    ], lambda calls: not any(t == "book_flight" for t, _ in calls)
+                     and ("check_seat_availability", "GOA-101") in calls),
 ]
+
+BOOK_OFFER = [(0.0, {"kind": "chunk", "text": "flight from Delhi to Goa tomorrow", "final": True})]
+AFFIRM_CASES = ["correct", "Correct!", "right", "That's right.", "yup",
+                "sounds good", "please do", "absolutely", "Perfect!"]
+NEG_CASES = ["wrong", "Not now.", "not quite", "nope"]
 
 
 class MockLLM(BaseHTTPRequestHandler):
@@ -60,8 +87,13 @@ class MockLLM(BaseHTTPRequestHandler):
         user = body["messages"][-1]["content"]
         slots = _extract(user)                     # extracts like the keyword path...
         words = _clean_words(user)
-        if words and words[0] in _AFFIRM:          # ...but maps affirmatives to commit,
-            slots["commit"] = True                 # as perception's prompt instructs
+        if not slots and words and words[0] in _AFFIRM:
+            slots["commit"] = True                 # ...but maps a bare affirmative to
+                                                   # commit, as perception's prompt
+                                                   # instructs. (Whether a real LLM
+                                                   # attaches commit to a mixed turn is
+                                                   # extraction semantics; this mock
+                                                   # isolates answer resolution.)
         resp = json.dumps({"choices": [{"message": {"content": json.dumps(slots)}}]}).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -73,9 +105,17 @@ class MockLLM(BaseHTTPRequestHandler):
         pass
 
 
-def run(scn_events):
+def env_off():
+    return {k: os.environ.pop(k) for k in LLM_ENV if k in os.environ}
+
+
+def env_restore(saved):
+    os.environ.update(saved)
+
+
+def run(events):
     return simulate({"name": "demo", "multimodal": False, "faults": set(),
-                     "events": scn_events})["trace"]
+                     "events": events})["trace"]
 
 
 def calls_of(trace):
@@ -83,36 +123,119 @@ def calls_of(trace):
             for e in trace if e.get("dir") == "out" and e.get("kind") == "call"]
 
 
+def outcome(trace):
+    """What actually happened, phrasing-independent: the terms a judge would
+    compare - booked what, cancelled what, asked what, ended how."""
+    booked, cancelled, ref2flight = [], [], {}
+    for e in trace:
+        if e.get("dir") == "in" and e.get("kind") == "tool_result" and e["result"].get("ok"):
+            if e.get("tool") == "book_flight":
+                booked.append(e["args"]["flight_id"])
+                ref2flight[e["result"]["booking_ref"]] = e["args"]["flight_id"]
+            elif e.get("tool") == "cancel_booking":
+                cancelled.append(ref2flight.get(e["result"]["cancelled"], e["result"]["cancelled"]))
+    outs = [e for e in trace if e.get("dir") == "out"]
+    finals = [o for o in outs if o["kind"] == "final"]
+    return {
+        "booked": sorted(booked),
+        "cancelled": sorted(cancelled),
+        "questions_asked": [o["text"] for o in outs if o["kind"] == "clarify"],
+        "final_booked": bool(finals and finals[-1].get("booked")),
+        "offer_left_open": bool(finals) and finals[-1]["text"].rstrip().endswith("?"),
+    }
+
+
 def main():
-    srv = HTTPServer(("127.0.0.1", 0), MockLLM)
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
-    mock_url = f"http://127.0.0.1:{srv.server_address[1]}/v1/chat/completions"
+    real = "--real" in sys.argv
 
-    # sanity: with the mock on, "yes" really does extract to {"commit": true}
-    os.environ["AURA_LLM_URL"] = mock_url
-    import perception
-    got = perception.extract({"kind": "chunk", "text": "yes"})
-    del os.environ["AURA_LLM_URL"]
-    print(f'mock check: "yes" extracts to {got} in LLM mode (vs {{}} deterministically)\n')
-    assert got == {"commit": True}, got
-
-    ok = True
-    for name, events, expected in FLOWS:
-        det = run(events)                          # deterministic path
-        os.environ["AURA_LLM_URL"] = mock_url
-        llm = run(events)                          # LLM path, same events
+    if real:
+        if not any(os.getenv(k) for k in ("AURA_LLM_URL", "OPENAI_API_KEY", "GEMINI_API_KEY")):
+            print("--real needs a configured provider: set AURA_LLM_URL, "
+                  "OPENAI_API_KEY or GEMINI_API_KEY. Refusing to run.")
+            raise SystemExit(2)
+        provider = ("AURA_LLM_URL=" + os.environ["AURA_LLM_URL"] if os.getenv("AURA_LLM_URL")
+                    else "OpenAI" if os.getenv("OPENAI_API_KEY") else "Gemini")
+        print(f"REAL mode: LLM side uses {provider}; deterministic side runs with "
+              "LLM variables stripped. Comparing OUTCOMES, not trace bytes.\n")
+        llm_url = None
+    else:
+        srv = HTTPServer(("127.0.0.1", 0), MockLLM)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        llm_url = f"http://127.0.0.1:{srv.server_address[1]}/v1/chat/completions"
+        saved = env_off()
+        os.environ["AURA_LLM_URL"] = llm_url
+        import perception
+        got = perception.extract({"kind": "chunk", "text": "yes"})
         del os.environ["AURA_LLM_URL"]
+        env_restore(saved)
+        print(f'mock check: "yes" extracts to {got} in LLM mode (vs {{}} deterministically)\n')
+        assert got == {"commit": True}, got
 
-        identical = det == llm
+    import perception
+    ok = True
+
+    def check(name, events, expected, verbose=True):
+        nonlocal ok
+        saved = env_off()
+        det = run(events)                          # deterministic path, always env-free
+        if real:
+            env_restore(saved)
+            llm = run(events)                      # live provider, ambient env
+        else:
+            os.environ["AURA_LLM_URL"] = llm_url
+            llm = run(events)                      # mock endpoint
+            del os.environ["AURA_LLM_URL"]
+            env_restore(saved)
+
         behaved = expected(calls_of(llm)) and expected(calls_of(det))
-        ok &= identical and behaved
-        print(f"{'PASS' if identical and behaved else 'FAIL'}  {name}")
-        print(f"      traces identical across modes: {identical}"
-              f"  ({len(det)} events)")
-        print(f"      calls: {calls_of(llm)}")
-    print("\nall flows resolve identically with and without the LLM" if ok
-          else "\nMISMATCH - see above")
-    srv.shutdown()
+        if real:
+            same = outcome(det) == outcome(llm)
+        else:
+            same = det == llm
+        ok &= same and behaved
+        mark = "PASS" if same and behaved else "FAIL"
+
+        if real:
+            print(f"{mark}  {name}")
+            for _, ev in events:                   # what each side extracted, per turn
+                text = ev.get("text", "")
+                d = _extract(text)
+                r = perception.extract({"kind": "chunk", "text": text})
+                flag = "" if d == r else "   <- differs"
+                print(f'      "{text}"\n            det : {d}\n            real: {r}{flag}')
+            if not same:
+                print(f"      OUTCOME MISMATCH:\n            det : {outcome(det)}"
+                      f"\n            real: {outcome(llm)}")
+            elif not behaved:
+                print(f"      unexpected calls: {calls_of(llm)}")
+            else:
+                print(f"      outcome: {outcome(llm)}")
+        elif verbose:
+            print(f"{mark}  {name}")
+            print(f"      traces identical across modes: {det == llm}  ({len(det)} events)")
+            print(f"      calls: {calls_of(llm)}")
+        else:
+            print(f"{mark}  {name}  (identical={det == llm})")
+
+    for name, events, expected in FLOWS:
+        check(name, events, expected)
+
+    print("\nwidened detector words against a live book offer:")
+    for word in AFFIRM_CASES:
+        check(f'affirmative "{word}" books the offer',
+              BOOK_OFFER + [(2.0, {"kind": "chunk", "text": word, "final": True})],
+              lambda calls: ("book_flight", "GOA-101") in calls, verbose=False)
+    for word in NEG_CASES:
+        check(f'negative "{word}" declines; stray yes books nothing',
+              BOOK_OFFER + [(2.0, {"kind": "chunk", "text": word, "final": True}),
+                            (3.5, {"kind": "chunk", "text": "yes", "final": True})],
+              lambda calls: not any(t == "book_flight" for t, _ in calls), verbose=False)
+
+    if ok:
+        print("\nall flows resolve identically" + (" (by outcome) with the live model"
+                                                   if real else " with and without the LLM"))
+    else:
+        print("\nMISMATCH - do not demo until the above is understood")
     raise SystemExit(0 if ok else 1)
 
 

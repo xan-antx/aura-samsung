@@ -1,19 +1,16 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import "./App.css";
 
-// Two panels, one clock. Left: the conversation as a chat thread - time
-// flows downward, so speaking order is unambiguous. Right: one card per
-// tool call. The pairing is the point: when the correction message appears
-// on the left, the card it invalidates dies on the right at the same
-// moment, while unrelated cards keep running.
+// Two modes. Replay: the stepped walkthrough over exported scenario traces
+// (unchanged). Live: a chat driving the real agent over a WebSocket - same
+// Timeline and Tree, fed from the live stream, playhead following real time.
 
 const SLOT_KEYS = ["origin", "destination", "date", "pax"];
 const SLOT_NAMES = { origin: "origin", destination: "destination", date: "date", pax: "passengers" };
-const STEP_SPEED = 3.5; // trace-seconds per wall-second while stepping
+const STEP_SPEED = 3.5;
 const FLAGSHIP = "mid-utterance destination change";
+const PARTIAL_PAUSE_MS = 600;   // typing pause before a non-final chunk is sent
 
-// Offered in the picker. The export still carries every scenario; these are
-// the five with something to watch.
 const PICKER = [
   "mid-utterance destination change",
   "duplicate booking guard",
@@ -62,18 +59,20 @@ function cardTitle(c) {
     const seat = (a.seat || "").split(":")[1] || a.seat || "?";
     return `Booking · seat ${seat} on ${a.flight_id} ×${a.pax ?? 1}`;
   }
+  if (c.tool === "cancel_booking")
+    return `Cancelling booking ${a.booking_ref}`;
   return c.tool;
 }
 
 function cardResult(r) {
   if (!r) return "";
   if (r.booking_ref) return `Booked · ref ${r.booking_ref}`;
+  if (r.cancelled) return `Cancelled · ref ${r.cancelled}`;
   if (r.flights) return `Found ${r.flights.length} flights`;
   if (r.seats) return `${r.seats.length} seats free`;
   return r.ok ? "Done" : r.error || "Failed";
 }
 
-// Generic beats for scenarios without authored copy.
 function deriveBeats(trace, tEnd) {
   const first = (pred) => trace.find(pred);
   const call = first((e) => e.kind === "call");
@@ -109,6 +108,7 @@ function deriveBeats(trace, tEnd) {
 }
 
 function App() {
+  const [mode, setMode] = useState("replay");
   const [scenarios, setScenarios] = useState([]);
   const [sel, setSel] = useState(0);
   const [view, setView] = useState("timeline");
@@ -117,8 +117,17 @@ function App() {
   const rawRef = useRef("");
   const threadRef = useRef(null);
 
-  // Data contract unchanged: poll /trace.json once a second, reset only when
-  // the file actually changed. Old single-scenario files still work.
+  // ---- live mode state ----
+  const [liveTrace, setLiveTrace] = useState([]);
+  const [liveStatus, setLiveStatus] = useState({ llm: null, conn: "off", latencies: {} });
+  const [livePh, setLivePh] = useState(0);
+  const [draft, setDraft] = useState("");
+  const wsRef = useRef(null);
+  const anchorRef = useRef({ sn: 0, pf: 0 });
+  const lastSentRef = useRef("");
+  const draftTimerRef = useRef(null);
+
+  // Data contract unchanged: poll /trace.json once a second (replay data).
   useEffect(() => {
     const loadTrace = () => {
       fetch("/trace.json?t=" + Date.now())
@@ -144,16 +153,69 @@ function App() {
     return () => clearInterval(interval);
   }, []);
 
+  // ---- live websocket ----
+  useEffect(() => {
+    if (mode !== "live") return;
+    const port = new URLSearchParams(location.search).get("live") || 8765;
+    const ws = new WebSocket(`ws://${location.hostname}:${port}/ws`);
+    wsRef.current = ws;
+    setLiveStatus((s) => ({ ...s, conn: "connecting" }));
+    ws.onopen = () => setLiveStatus((s) => ({ ...s, conn: "live" }));
+    ws.onclose = () => setLiveStatus((s) => ({ ...s, conn: "closed" }));
+    ws.onerror = () => setLiveStatus((s) => ({ ...s, conn: "closed" }));
+    ws.onmessage = (e) => {
+      const m = JSON.parse(e.data);
+      if (typeof m.now === "number")
+        anchorRef.current = { sn: m.now, pf: performance.now() };
+      if (m.type === "status")
+        setLiveStatus((s) => ({
+          ...s, llm: m.llm,
+          state: m.llm_state || (m.llm ? "untried" : "off"),
+          latencies: m.latencies || s.latencies || {},
+        }));
+      else if (m.type === "reset") {
+        setLiveTrace([]);
+        lastSentRef.current = "";
+      } else if (m.type === "trace") setLiveTrace((tr) => [...tr, m.event]);
+    };
+    return () => {
+      ws.close();
+      wsRef.current = null;
+    };
+  }, [mode]);
+
+  // live playhead follows the real clock, anchored to server time. Interval-
+  // driven, not rAF: a backgrounded or occluded tab still gets timer ticks,
+  // so the live view never freezes; rAF only adds smoothness when available.
+  useEffect(() => {
+    if (mode !== "live") return;
+    const tick = () => {
+      const a = anchorRef.current;
+      setLivePh(a.pf ? a.sn + (performance.now() - a.pf) / 1000 : 0);
+    };
+    const iv = setInterval(tick, 100);
+    let raf;
+    const smooth = () => {
+      tick();
+      raf = requestAnimationFrame(smooth);
+    };
+    raf = requestAnimationFrame(smooth);
+    return () => {
+      clearInterval(iv);
+      cancelAnimationFrame(raf);
+    };
+  }, [mode]);
+
   const current = scenarios[sel] || { name: "", blurb: "", multimodal: false, trace: [] };
-  const trace = current.trace;
-  const authored = current.name === FLAGSHIP;
+  const trace = mode === "live" ? liveTrace : current.trace;
+  const authored = mode === "replay" && current.name === FLAGSHIP;
 
   const model = useMemo(() => {
     const calls = [];
     const byId = {};
     const thread = [];
     const slotChanges = [];
-    const lastSeen = {}; // a re-issued call re-states unchanged slots: not a change
+    const lastSeen = {};
     let tEnd = 0;
     for (const e of trace) {
       tEnd = Math.max(tEnd, e.t || 0);
@@ -180,7 +242,9 @@ function App() {
         byId[e.call_id].end = e.t;
         byId[e.call_id].result = e.result;
       } else if (e.kind === "chunk" || e.kind === "interrupt") {
-        thread.push({ t: e.t, side: "user", text: e.text, correction: e.kind === "interrupt" });
+        thread.push({ t: e.t, side: "user", text: e.text,
+                      correction: e.kind === "interrupt",
+                      partial: e.kind === "chunk" && !e.final });
       } else if (e.kind === "frame" || e.kind === "audio") {
         thread.push({ t: e.t, side: "user", text: e.caption || "(audio)", frame: true });
       } else if (e.kind === "say" || e.kind === "final" || e.kind === "clarify") {
@@ -192,15 +256,11 @@ function App() {
   }, [trace]);
 
   const beats = useMemo(
-    () => (authored ? AUTHORED_BEATS : deriveBeats(trace, model.tEnd)),
-    [authored, trace, model.tEnd]
+    () => (mode === "live" ? [] : authored ? AUTHORED_BEATS : deriveBeats(trace, model.tEnd)),
+    [mode, authored, trace, model.tEnd]
   );
 
-  // Dependency tree: static layout, computed once per scenario. Depth comes
-  // from real derivation - a call whose argument value appeared in an earlier
-  // call's result sits one row below that call. Edges run slot -> call for
-  // every slot in the call's (transitively inherited) reads: that is what
-  // the timeline cannot show.
+  // Dependency tree: static layout, computed once per trace.
   const tree = useMemo(() => {
     const flat = (v, out = []) => {
       if (v == null) return out;
@@ -219,8 +279,6 @@ function App() {
           c.parent = p.id;
         }
       }
-      // a completed mutation whose reads went stale afterwards was NOT
-      // cancelled - it is still active in the world, and must render so
       if (c.mutating && c.result?.ok && !c.cancelled) {
         const hit = model.slotChanges.find((s) => s.t > c.end && c.reads.includes(s.key));
         if (hit) c.supersededAt = hit.t;
@@ -248,8 +306,7 @@ function App() {
     return { calls, edges, pos };
   }, [model]);
 
-  // Stepping: tween the playhead toward the requested beat. Anchored to wall
-  // time with a snap timeout so a step always lands even if rAF frames stall.
+  // Replay stepping: tween the playhead toward the requested beat.
   const playheadRef = useRef(0);
   playheadRef.current = playhead;
   useEffect(() => {
@@ -280,12 +337,15 @@ function App() {
     };
   }, [target]);
 
-  const beat = beats.reduce((n, b) => (playhead >= b.t - 1e-6 ? n + 1 : n), 0);
+  const ph = mode === "live" ? livePh : playhead;
+  const beat = beats.reduce((n, b) => (ph >= b.t - 1e-6 ? n + 1 : n), 0);
   const next = () => beat < beats.length && setTarget(beats[beat].t);
   const back = () => setTarget(beat > 1 ? beats[beat - 2].t : 0);
 
   useEffect(() => {
+    if (mode !== "replay") return;
     const onKey = (e) => {
+      if (e.target.tagName === "INPUT") return;
       if (e.key === "ArrowRight") next();
       if (e.key === "ArrowLeft") back();
     };
@@ -293,15 +353,75 @@ function App() {
     return () => window.removeEventListener("keydown", onKey);
   });
 
-  const seen = (t) => playhead >= t - 1e-9;
-  const visibleMsgs = model.thread.filter((m) => seen(m.t));
-  const visibleCalls = model.calls.filter((c) => seen(c.start));
+  const T = mode === "live" ? Math.max(model.tEnd, ph, 8) * 1.08 : Math.max(model.tEnd, 0.001) * 1.08;
+  const seen = (t) => ph >= t - 1e-9;
 
-  // the thread grows downward; keep the newest message in view
+  // ---- live chat input: act before Enter ----
+  const sendChunk = (text, final) => {
+    const ws = wsRef.current;
+    if (ws && ws.readyState === 1 && text) ws.send(JSON.stringify({ type: "chunk", text, final }));
+  };
+  const onDraft = (v) => {
+    setDraft(v);
+    clearTimeout(draftTimerRef.current);
+    draftTimerRef.current = setTimeout(() => {
+      // a pause at a word boundary: send the words completed so far,
+      // cumulative, as a NON-final chunk - never a half-typed word
+      const upto = /\s$/.test(v) ? v.trim() : v.slice(0, v.lastIndexOf(" ")).trim();
+      if (upto && upto !== lastSentRef.current) {
+        lastSentRef.current = upto;
+        sendChunk(upto, false);
+      }
+    }, PARTIAL_PAUSE_MS);
+  };
+  const onEnter = () => {
+    clearTimeout(draftTimerRef.current);
+    const full = draft.trim();
+    if (!full) return;
+    sendChunk(full, true);
+    lastSentRef.current = "";
+    setDraft("");
+  };
+  const doReset = () => {
+    const ws = wsRef.current;
+    if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: "reset" }));
+    setLiveTrace([]);
+    lastSentRef.current = "";
+    setDraft("");
+  };
+
+  // thread display: in live mode, superseded partials collapse away and the
+  // agent acting between a partial and its Enter is marked visibly
+  const actsCC = useMemo(
+    () => trace.filter((e) => e.dir === "out" && (e.kind === "call" || e.kind === "cancel")),
+    [trace]
+  );
+  const userEvs = useMemo(
+    () => model.thread.filter((m) => m.side === "user"),
+    [model]
+  );
+  const displayThread = useMemo(() => {
+    if (mode !== "live") return model.thread;
+    return model.thread.filter((m, i) => {
+      if (m.side !== "user" || !m.partial) return true;
+      return !model.thread.slice(i + 1).some((x) => x.side === "user");
+    });
+  }, [mode, model]);
+  const actedEarly = (m) => {
+    if (mode !== "live") return false;
+    if (m.partial) return actsCC.some((a) => a.t >= m.t - 1e-9);
+    const i = userEvs.indexOf(m);
+    if (i > 0 && userEvs[i - 1].partial)
+      // strictly before this final: actions born in the final's own dispatch
+      // share its timestamp and do not count as acting early
+      return actsCC.some((a) => a.t >= userEvs[i - 1].t - 1e-9 && a.t < m.t - 1e-9);
+    return false;
+  };
+
   useEffect(() => {
     const el = threadRef.current;
     if (el) el.scrollTop = el.scrollHeight;
-  }, [visibleMsgs.length]);
+  }, [displayThread.filter((m) => seen(m.t)).length, draft]);
 
   const banner = authored
     ? beat === 0
@@ -315,21 +435,31 @@ function App() {
     <div className="app">
       <header className="top">
         <span className="brand">PRISM</span>
-        <select
-          className="picker"
-          value={sel}
-          onChange={(e) => {
-            setSel(Number(e.target.value));
-            setPlayhead(0);
-            setTarget(null);
-          }}
-        >
-          {scenarios.map((s, i) => (
-            <option key={s.name} value={i}>
-              {cap(s.name)}{s.multimodal ? "  (multimodal)" : ""}
-            </option>
-          ))}
-        </select>
+        <div className="viewtoggle">
+          <button className={mode === "replay" ? "on" : ""} onClick={() => setMode("replay")}>
+            Replay
+          </button>
+          <button className={mode === "live" ? "on" : ""} onClick={() => setMode("live")}>
+            Live
+          </button>
+        </div>
+        {mode === "replay" && (
+          <select
+            className="picker"
+            value={sel}
+            onChange={(e) => {
+              setSel(Number(e.target.value));
+              setPlayhead(0);
+              setTarget(null);
+            }}
+          >
+            {scenarios.map((s, i) => (
+              <option key={s.name} value={i}>
+                {cap(s.name)}{s.multimodal ? "  (multimodal)" : ""}
+              </option>
+            ))}
+          </select>
+        )}
         <div className="viewtoggle">
           <button className={view === "timeline" ? "on" : ""} onClick={() => setView("timeline")}>
             Timeline
@@ -339,37 +469,63 @@ function App() {
           </button>
         </div>
         <div className="controls">
-          <input
-            type="range" min="0" max={model.tEnd || 1} step="0.01"
-            value={Math.min(playhead, model.tEnd || 1)}
-            onChange={(e) => { setTarget(null); setPlayhead(Number(e.target.value)); }}
-          />
-          <span className="clock mono">t={playhead.toFixed(2)}s</span>
+          {mode === "replay" && (
+            <input
+              type="range" min="0" max={model.tEnd || 1} step="0.01"
+              value={Math.min(playhead, model.tEnd || 1)}
+              onChange={(e) => { setTarget(null); setPlayhead(Number(e.target.value)); }}
+            />
+          )}
+          <span className="clock mono">t={ph.toFixed(2)}s</span>
         </div>
       </header>
 
-      {current.blurb && <p className="blurb">{current.blurb}</p>}
+      {mode === "replay" && current.blurb && <p className="blurb">{current.blurb}</p>}
 
-      <section className="banner">
-        <div className="banner-text">
-          <h1>
-            {banner.n && <span className="beat-n mono">{banner.n}/{beats.length}</span>}
-            {banner.title}
-          </h1>
-          {banner.caption && <p className="cap">{banner.caption}</p>}
-        </div>
-        <div className="steps">
-          <button className="step back" onClick={back} disabled={beat === 0 && playhead === 0}>
-            ← Back
-          </button>
-          <button className="step next" onClick={next} disabled={beat === beats.length}>
-            Next →
-          </button>
-        </div>
-      </section>
+      {mode === "replay" && (
+        <section className="banner">
+          <div className="banner-text">
+            <h1 className={authored ? "" : "h-blurb"}>
+              {banner.n && <span className="beat-n mono">{banner.n}/{beats.length}</span>}
+              {authored ? banner.title : (current.blurb && beat > 0 ? current.blurb : banner.title)}
+            </h1>
+            {(authored ? banner.caption : beat > 0 ? beats[beat - 1].caption : banner.caption) && (
+              <p className="cap">
+                {authored ? banner.caption : beat > 0 ? beats[beat - 1].caption : banner.caption}
+              </p>
+            )}
+          </div>
+          <div className="steps">
+            <button className="step back" onClick={back} disabled={beat === 0 && playhead === 0}>
+              ← Back
+            </button>
+            <button className="step next" onClick={next} disabled={beat === beats.length}>
+              Next →
+            </button>
+          </div>
+        </section>
+      )}
+
+      {mode === "live" && (
+        <section className="livebar">
+          <span className={"conn " + liveStatus.conn}>
+            {liveStatus.conn === "live" ? "● connected" :
+             liveStatus.conn === "connecting" ? "○ connecting…" : "○ disconnected"}
+          </span>
+          <span className={"llmflag mono" + (liveStatus.state === "failing" ? " red-text" : "")}>
+            extraction: {
+              liveStatus.state === "ok" ? "LLM (live)"
+              : liveStatus.state === "failing" ? "LLM FAILING — deterministic fallback"
+              : liveStatus.state === "untried" ? "LLM configured — no call yet"
+              : liveStatus.state === "off" ? "deterministic (no API key)"
+              : "…"}
+          </span>
+          <span className="hint">pause mid-sentence and the agent acts before you press Enter</span>
+          <button className="step" onClick={doReset}>Reset</button>
+        </section>
+      )}
 
       {view === "tree" && (() => {
-        // per-slot state at the playhead, shared by nodes and edge anchors
         const slotState = {};
         SLOT_KEYS.forEach((k) => {
           const past = model.slotChanges.filter((s) => s.key === k && seen(s.t));
@@ -378,7 +534,7 @@ function App() {
             prev: past.length > 1 ? past[past.length - 2] : null,
           };
         });
-        const ANCHOR = 2.4; // % of graph height: stale row above, current below
+        const ANCHOR = 2.4;
         return (
         <main className="treewrap">
           <div className="graph">
@@ -387,30 +543,18 @@ function App() {
                 const a = tree.pos[e.from];
                 const b = tree.pos[e.to];
                 const c = e.call;
-                // no wires to calls that don't exist yet: ghost nodes keep
-                // the structure visible, but their edges must not compete
-                // with the live ones
                 if (!a || !b || !seen(c.start)) return null;
                 const dead = c.cancelled && seen(c.cancelT);
-                // the kill edge burns red while the cancellation is the
-                // current subject, then settles: the closing frame is about
-                // the booking that resolved, not the call that died
-                const HOT = 1.2; // trace-seconds a call stays the subject
-                const hot = dead && playhead - c.cancelT < HOT;
-                // a call that finished (or whose kill cooled) more than the
-                // subject-window ago is old news: its edges stay traceable
-                // at ~20% but stop competing with whatever is happening now
+                const HOT = 1.2;
+                const hot = dead && ph - c.cancelT < HOT;
                 const quiet = dead
-                  ? playhead - c.cancelT >= HOT
-                  : c.result && seen(c.end) && playhead - c.end >= HOT;
+                  ? ph - c.cancelT >= HOT
+                  : c.result && seen(c.end) && ph - c.end >= HOT;
                 const kill = !e.derived && dead && c.by.includes(e.slot);
                 const cls =
                   "wire" +
                   (e.derived ? " derived" : "") +
                   (kill ? (hot ? " red" : " cooled") : quiet ? " quiet" : "");
-                // causal routing: once a slot has changed, the kill edge
-                // leaves from the struck stale row, live edges from the
-                // current-value row - dead value -> dead call, live -> live
                 let y1 = a.y;
                 if (!e.derived && slotState[e.slot]?.prev)
                   y1 = a.y + (kill ? -ANCHOR : ANCHOR);
@@ -419,7 +563,7 @@ function App() {
             </svg>
             {SLOT_KEYS.map((k) => {
               const { cur, prev } = slotState[k];
-              const flash = cur && cur.t > 0 && playhead - cur.t < 0.9 && playhead < model.tEnd;
+              const flash = cur && cur.t > 0 && ph - cur.t < 0.9 && (mode === "live" || ph < model.tEnd);
               const p = tree.pos[k];
               return (
                 <div
@@ -476,34 +620,60 @@ function App() {
 
       {view === "timeline" && (
       <main className="panels">
-        {/* ---- conversation thread ---- */}
-        <section className="thread" ref={threadRef}>
-          {visibleMsgs.map((m, i) => (
-            <div key={i} className={"msg " + m.side + (m.kind === "say" ? "" : " strong")}>
+        <section className="threadwrap">
+          <div className="thread" ref={threadRef}>
+            {displayThread.filter((m) => seen(m.t)).map((m, i) => (
               <div
+                key={i}
                 className={
-                  "bubble" +
-                  (m.correction ? " correction" : "") +
-                  (m.frame ? " frame" : "")
+                  "msg " + m.side +
+                  (m.kind === "say" ? "" : " strong") +
+                  (mode === "live" && m.partial ? " partial" : "")
                 }
               >
-                {m.correction && <span className="tag">correction</span>}
-                {m.frame && <span className="tag neutral">camera</span>}
-                {m.text}
+                <div
+                  className={
+                    "bubble" +
+                    (m.correction ? " correction" : "") +
+                    (m.frame ? " frame" : "")
+                  }
+                >
+                  {m.correction && <span className="tag">correction</span>}
+                  {m.frame && <span className="tag neutral">camera</span>}
+                  {mode === "live" && m.partial && <span className="tag neutral">typing…</span>}
+                  {actedEarly(m) && <span className="tag early">⚡ acted before Enter</span>}
+                  {m.text}
+                </div>
+                <span className="stamp mono">{m.t.toFixed(1)}s</span>
               </div>
-              <span className="stamp mono">{m.t.toFixed(1)}s</span>
+            ))}
+          </div>
+          {mode === "live" && (
+            <div className="chatline">
+              <input
+                className="chatinput"
+                placeholder={liveStatus.conn === "live" ? "Talk to the agent…" : "not connected"}
+                value={draft}
+                disabled={liveStatus.conn !== "live"}
+                onChange={(e) => onDraft(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && onEnter()}
+              />
+              <button className="step next" onClick={onEnter}>Send</button>
             </div>
-          ))}
+          )}
         </section>
 
-        {/* ---- work panel: one card per tool call ---- */}
         <section className="work">
-          {visibleCalls.map((c) => {
+          {model.calls.filter((c) => seen(c.start)).map((c) => {
             const dead = c.cancelled && seen(c.cancelT);
             const finished = !c.cancelled && seen(c.end) && c.result;
             const running = !dead && !finished;
+            // live: an in-flight call has no end time yet - progress runs
+            // against the server-declared latency for that tool
             const dur = Math.max(c.end - c.start, 0.02);
-            const fill = Math.max(0, Math.min(playhead, c.end) - c.start) / dur;
+            const fill = mode === "live" && running && !c.result
+              ? Math.min((ph - c.start) / (liveStatus.latencies[c.tool] || 3), 1)
+              : Math.max(0, Math.min(ph, c.end) - c.start) / dur;
             return (
               <div key={c.id} className={"card" + (dead ? " killed" : finished ? " done" : "")}>
                 <div className="card-head">
@@ -512,7 +682,7 @@ function App() {
                 </div>
                 {running && (
                   <div className="progress">
-                    <i style={{ width: `${fill * 100}%` }} />
+                    <i style={{ width: `${Math.min(fill, 1) * 100}%` }} />
                   </div>
                 )}
                 {finished && <div className="card-result">{cardResult(c.result)}</div>}
@@ -535,7 +705,7 @@ function App() {
           const cur = past.length ? past[past.length - 1] : null;
           const prev = past.length > 1 ? past[past.length - 2] : null;
           const flipped = cur && prev && prev.value !== cur.value;
-          const flash = cur && cur.t > 0 && playhead - cur.t < 0.9 && playhead < model.tEnd;
+          const flash = cur && cur.t > 0 && ph - cur.t < 0.9 && (mode === "live" || ph < model.tEnd);
           return (
             <div key={k} className={"slot" + (flash ? " flash" : "")}>
               <span className="slot-key">{SLOT_NAMES[k]}</span>

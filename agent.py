@@ -120,24 +120,48 @@ def _sense(ev: dict) -> dict:
 
 # Deterministic yes/no detection for answers to the agent's own questions -
 # coordinator-side, like repair cues, so it works with or without an LLM.
-_AFFIRM = {"yes", "yeah", "yep", "sure", "ok", "okay"}
-_NEG = {"no", "nope", "nah"}
+# The vocabulary is deliberately shaped around what the agent asks: the
+# confirmation ends "..., correct?", so the literal echo must be understood.
+_AFFIRM = {"yes", "yeah", "yep", "yup", "sure", "ok", "okay",
+           "correct", "right", "absolutely", "perfect"}
+_AFFIRM_PHRASES = (("go", "ahead"), ("do", "it"), ("that's", "right"),
+                   ("sounds", "good"), ("please", "do"))
+_NEG = {"no", "nope", "nah", "wrong"}
+_NEG_PHRASES = (("never", "mind"), ("not", "now"), ("not", "quite"))
 
 
 def _clean_words(text: str) -> list[str]:
-    return [w.strip(".,!?-'") for w in text.lower().split()]
+    return [w.strip(".,!?-'") for w in text.lower().replace("’", "'").split()]
 
 
-def _affirmative(text: str) -> bool:
-    words = _clean_words(text)
-    return bool(words) and (words[0] in _AFFIRM
-                            or "go ahead" in " ".join(words) or "do it" in " ".join(words))
+def _phrase_in(words: list[str], phrases) -> bool:
+    # consecutive cleaned words, never substrings: "cargo ahead" is not
+    # "go ahead", and "please don't" is not "please do"
+    return any(tuple(words[i:i + len(p)]) == p
+               for p in phrases for i in range(len(words) - len(p) + 1))
+
+
+def _commit_words(text: str) -> bool:
+    """The deterministic evidence for a commit - the same rule the keyword
+    extractor uses. An LLM may map a bare "yes" to {"commit": true}; without
+    an open question or one of these words, that commit is dropped, so a
+    stray "yes" can never book anything in either mode."""
+    t = text.lower()
+    return "book" in t or "confirm" in t
 
 
 def _negative(text: str) -> bool:
     words = _clean_words(text)
-    return bool(words) and (words[0] in _NEG
-                            or "don't" in words or "never mind" in " ".join(words))
+    return bool(words) and (words[0] in _NEG or "don't" in words
+                            or _phrase_in(words, _NEG_PHRASES))
+
+
+def _affirmative(text: str) -> bool:
+    if _negative(text):
+        return False           # "no, go ahead", "please don't": refusal wins -
+                               # a mutation is never executed on a doubtful yes
+    words = _clean_words(text)
+    return bool(words) and (words[0] in _AFFIRM or _phrase_in(words, _AFFIRM_PHRASES))
 
 
 REPAIR_CUES = {"actually", "wait", "sorry", "no"}
@@ -223,13 +247,23 @@ class Agent:
         text = ev.get("text", "")
         if _repair_cue(text):
             self.repair_cue_at = now               # freeze mutations: correction incoming
-        changed = self._apply(_sense(ev), now)     # may itself resolve a slot confirmation
+        changed = self._apply(self._gate_commit(_sense(ev), text), now)
         acts = self._invalidate(changed, now)          # cancel stale work FIRST
         acts += self._answer(changed, text, now)       # then resolve the pending question
         acts += self._plan(now)
         if ev.get("final"):
             acts += self._finalise(now)
         return acts
+
+    def _gate_commit(self, extracted: dict, text: str) -> dict:
+        """A commit needs evidence: an open question (whose meaning _answer
+        owns) or an explicit commit word in the raw text. Otherwise it is an
+        extraction artifact of an answer-shaped turn and is dropped. On the
+        deterministic path this is a no-op - the keyword extractor only emits
+        commit when the words are present."""
+        if extracted.get("commit") and self.pending_q is None and not _commit_words(text):
+            return {k: v for k, v in extracted.items() if k != "commit"}
+        return extracted
 
     def _answer(self, changed: set, text: str, now: float) -> list[Action]:
         """Resolve the user's turn against the pending question. The decision
@@ -290,7 +324,7 @@ class Agent:
         if now - self.last_spoke > self.FILLER_GAP:
             acts.append(self._say("Let me take a look at that.", now))
         self.pending_perception += 1
-        changed = self._apply(_sense(ev), now)
+        changed = self._apply(self._gate_commit(_sense(ev), ev.get("caption", "")), now)
         if changed - {"commit"} and self.pending_q:
             self.pending_q = None                  # new perceived content supersedes it
         acts += self._invalidate(changed, now)

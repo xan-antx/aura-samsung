@@ -23,6 +23,25 @@ services:
         for args in (["--selfcheck"], [], ["--export-trace", "ui/public/trace.json"]):
             subprocess.run([sys.executable, "harness.py", *args], check=True)
 
+  # Live chat adapter: the real agent on a real clock behind a WebSocket.
+  # The UI's Live mode connects to it on port 8765. LLM extraction turns on
+  # automatically if a provider key is exported in the host shell.
+  live:
+    build:
+      context: .
+      dockerfile: Dockerfile.live
+    ports:
+      - "8765:8765"
+    environment:
+      # base URL and model must travel with the key, or a Groq key gets sent
+      # to api.openai.com and fails silently
+      AURA_LLM_URL: ${AURA_LLM_URL:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      AURA_LLM_MODEL: ${AURA_LLM_MODEL:-}
+      AURA_LLM_TIMEOUT: ${AURA_LLM_TIMEOUT:-}
+
   visualizer:
     build: ./ui
     ports:

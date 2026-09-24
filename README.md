@@ -124,6 +124,26 @@ and delete the local scorer in favour of the real one.
 - The harness scenarios feed pre-captioned frames; `perception.extract` also
   accepts raw WAV (faster-whisper) and PNG (VLM captioning) when those
   optional extras are configured.
+- Groq (OpenAI-compatible endpoint) is the tested live provider:
+
+  ```bash
+  export OPENAI_API_KEY=gsk_...
+  export OPENAI_BASE_URL=https://api.groq.com/openai/v1
+  export AURA_LLM_MODEL=openai/gpt-oss-20b
+  ```
+
+  List currently available models with:
+
+  ```bash
+  curl -s https://api.groq.com/openai/v1/models -H "Authorization: Bearer $OPENAI_API_KEY"
+  ```
+
+  `AURA_LLM_MODEL` accepts a comma-separated list: 429/503 get one short
+  retry, then 404/429/503 move to the next model, and only then does the
+  deterministic fallback take over. The first failure of each kind is
+  logged once to stderr (status + provider error body, never the key), and
+  the live UI's status line reflects whether LLM calls are actually
+  succeeding - not merely whether a key is set.
 
 ## Stubbed, deliberately
 

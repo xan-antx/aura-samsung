@@ -17,9 +17,16 @@ import io
 import json
 import os
 import re
+import sys
+import time
 import urllib.error
 import urllib.request
 from typing import Any
+
+# Cloudflare-fronted providers (Groq among them) reject Python's default
+# `Python-urllib` agent with 403 "error code: 1010" - every outbound request
+# carries an explicit agent instead.
+USER_AGENT = "aura-samsung/1.0"
 
 # --- Schema and normalization constants --------------------------------------
 
@@ -159,6 +166,74 @@ def _fallback_extract(text: str) -> dict[str, Any]:
 
 # --- LLM Client & Slot Extraction --------------------------------------------
 
+_WARNED: set = set()      # (context, kind) pairs already reported to stderr
+_LLM_OK: bool | None = None   # None = no call attempted yet
+
+
+def _warn_once(context: str, exc: Exception) -> None:
+    """The fallback stays, but never silently: the first failure of each kind
+    is reported to stderr with the HTTP status and the provider's error body.
+    Keys are never logged (no headers, no env)."""
+    if isinstance(exc, urllib.error.HTTPError):
+        try:
+            body = exc.read(500).decode("utf-8", "replace")
+        except Exception:
+            body = ""
+        key = (context, "http", exc.code)
+        detail = f"HTTP {exc.code}: {body!r}"
+    else:
+        key = (context, type(exc).__name__)
+        detail = f"{type(exc).__name__}: {exc}"
+    if key in _WARNED:
+        return
+    _WARNED.add(key)
+    print(f"[perception] {context} failed ({detail}) - "
+          "falling back to the deterministic extractor", file=sys.stderr)
+
+
+def llm_status() -> str:
+    """'off' | 'untried' | 'ok' | 'failing' - so a UI can say whether LLM
+    extraction is actually working, not merely whether a key is present."""
+    if not _is_llm_configured():
+        return "off"
+    if _LLM_OK is None:
+        return "untried"
+    return "ok" if _LLM_OK else "failing"
+
+
+def _post_json(url: str, payload: dict, headers: dict, timeout: float) -> dict:
+    req = urllib.request.Request(
+        url, data=json.dumps(payload).encode("utf-8"),
+        headers={**headers, "User-Agent": USER_AGENT}, method="POST")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+_RETRY_ONCE = {429, 503}       # transient: one short backoff, same model
+_NEXT_MODEL = {404, 429, 503}  # then move down the model list
+
+
+def _try_models(default_model: str, attempt, timeout: float):
+    """AURA_LLM_MODEL may be a comma-separated list. 429/503 get one retry
+    after a short backoff (within the timeout budget); 404/429/503 then move
+    to the next model; anything else raises immediately."""
+    models = [m.strip() for m in os.getenv("AURA_LLM_MODEL", default_model).split(",")
+              if m.strip()]
+    last = None
+    for model in models:
+        for attempt_no in (0, 1):
+            try:
+                return attempt(model)
+            except urllib.error.HTTPError as e:
+                last = e
+                if attempt_no == 0 and e.code in _RETRY_ONCE:
+                    time.sleep(min(0.3, timeout / 4))
+                    continue
+                if e.code in _NEXT_MODEL:
+                    break                     # try the next model, if any
+                raise
+    raise last
+
 
 def _is_llm_configured() -> bool:
     return bool(os.getenv("AURA_LLM_URL") or os.getenv("OPENAI_API_KEY") or os.getenv("GEMINI_API_KEY"))
@@ -197,30 +272,32 @@ def _call_llm(text: str) -> dict:
         headers = {"Content-Type": "application/json"}
         if openai_key:
             headers["Authorization"] = f"Bearer {openai_key}"
-        payload = {
-            "model": os.getenv("AURA_LLM_MODEL", "gpt-4o-mini"),
-            "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": text},
-            ],
-            "temperature": 0.0,
-        }
-        req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST")
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            resp_data = json.loads(resp.read().decode("utf-8"))
-            return _parse_json_from_text(resp_data["choices"][0]["message"]["content"])
+
+        def attempt(model):
+            payload = {
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": text},
+                ],
+                "temperature": 0.0,
+            }
+            data = _post_json(url, payload, headers, timeout)
+            return _parse_json_from_text(data["choices"][0]["message"]["content"])
+
+        return _try_models("gpt-4o-mini", attempt, timeout)
 
     if gemini_key:
-        model = os.getenv("AURA_LLM_MODEL", "gemini-1.5-flash")
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={gemini_key}"
-        payload = {
-            "contents": [{"parts": [{"text": f"{SYSTEM_PROMPT}\n\nUser input: {text}"}]}],
-            "generationConfig": {"responseMimeType": "application/json", "temperature": 0.0},
-        }
-        req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json"}, method="POST")
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            resp_data = json.loads(resp.read().decode("utf-8"))
-            return _parse_json_from_text(resp_data["candidates"][0]["content"]["parts"][0]["text"])
+        def attempt(model):
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={gemini_key}"
+            payload = {
+                "contents": [{"parts": [{"text": f"{SYSTEM_PROMPT}\n\nUser input: {text}"}]}],
+                "generationConfig": {"responseMimeType": "application/json", "temperature": 0.0},
+            }
+            data = _post_json(url, payload, {"Content-Type": "application/json"}, timeout)
+            return _parse_json_from_text(data["candidates"][0]["content"]["parts"][0]["text"])
+
+        return _try_models("gemini-3.6-flash", attempt, timeout)
 
     raise ValueError("No LLM provider configured")
 
@@ -231,13 +308,17 @@ def extract_text_slots(text: str) -> dict[str, Any]:
         return {}
 
     if _is_llm_configured():
+        global _LLM_OK
         try:
             raw_slots = _call_llm(text)
+            _LLM_OK = True
             normalized = normalize_slots(raw_slots)
             if normalized:
                 return normalized
             return _fallback_extract(text)
-        except Exception:
+        except Exception as e:
+            _LLM_OK = False
+            _warn_once("LLM extraction", e)
             return _fallback_extract(text)
 
     return _fallback_extract(text)
@@ -312,13 +393,11 @@ def _caption_png(png_bytes: bytes) -> str | None:
             }],
             "max_tokens": 150,
         }
-        req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST")
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            resp_data = json.loads(resp.read().decode("utf-8"))
-            return resp_data["choices"][0]["message"]["content"].strip()
+        resp_data = _post_json(url, payload, headers, timeout)
+        return resp_data["choices"][0]["message"]["content"].strip()
 
     if gemini_key:
-        model = os.getenv("AURA_VLM_MODEL", "gemini-1.5-flash")
+        model = os.getenv("AURA_VLM_MODEL", "gemini-3.6-flash")
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={gemini_key}"
         payload = {
             "contents": [{
@@ -328,10 +407,8 @@ def _caption_png(png_bytes: bytes) -> str | None:
                 ]
             }]
         }
-        req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json"}, method="POST")
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            resp_data = json.loads(resp.read().decode("utf-8"))
-            return resp_data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        resp_data = _post_json(url, payload, {"Content-Type": "application/json"}, timeout)
+        return resp_data["candidates"][0]["content"]["parts"][0]["text"].strip()
 
     return None
 
@@ -351,7 +428,8 @@ def _extract_image(event: dict) -> dict[str, Any]:
     try:
         caption = _caption_png(raw_image)
         return extract_text_slots(caption) if caption else {}
-    except Exception:
+    except Exception as e:
+        _warn_once("VLM captioning", e)
         return {}
 
 

@@ -17,7 +17,7 @@ import json
 import os
 import sys
 
-from agent import Agent, CALL, CANCEL, CLARIFY, FINAL, SAY, _idem
+from agent import Agent, CALL, CANCEL, CLARIFY, FINAL, SAY, _idem, _affirmative, _negative
 
 # --- tool manifest & mocks -------------------------------------------------
 
@@ -821,6 +821,63 @@ def _selfcheck():
     last = _out(canc, FINAL)[-1]["text"]
     assert f"Cancelled your earlier booking MUM-101 (ref {mum_ref})" in last, last
     assert "shall I cancel" not in last, "resolved offer must not be re-asked"
+
+    # the detectors understand the answers the agent's own questions invite -
+    # including the literal echo of "..., correct?" - case and punctuation aside
+    for t in ("yes", "yes.", "yeah", "yep", "yup", "sure", "ok", "okay",
+              "correct", "Correct!", "right", "That's right.", "sounds good",
+              "please do", "absolutely", "Perfect!", "go ahead", "do it"):
+        assert _affirmative(t), f"should read as affirmative: {t!r}"
+    for t in ("no", "nope", "nah", "wrong", "Not now.", "not quite",
+              "don't", "never mind"):
+        assert _negative(t), f"should read as negative: {t!r}"
+    # non-answers stay non-answers; refusal dominates a mixed signal
+    for t in ("book it", "that's all", "to Pune", "cargo ahead", "please don't"):
+        assert not _affirmative(t), f"must not read as affirmative: {t!r}"
+    assert _negative("please don't") and _negative("no, go ahead")
+    assert not _affirmative("no, go ahead"), "refusal must win over a trailing yes-phrase"
+
+    # "right, change that to Goa": a real slot change supersedes the question -
+    # the old offer is neither confirmed nor executed, and nothing is booked
+    sup = {"name": "supersede", "multimodal": False, "faults": set(), "events": [
+        (0.0, {"kind": "chunk", "text": "flight from Delhi to Mumbai tomorrow", "final": True}),
+        (2.0, {"kind": "chunk", "text": "right, change that to Goa", "final": True}),
+    ]}
+    run = simulate(sup)
+    assert not _out(run, CALL, "book_flight"), "superseded offer must not book"
+    assert run["snapshot"]["slots"].get("destination") == "goa"
+    assert "Want me to book GOA-101?" in _out(run, FINAL)[-1]["text"], \
+        "after superseding, the fresh offer is for the new destination"
+
+    # LLM-shaped extraction (a bare "yes" -> {"commit": true}) must not change
+    # behaviour: with a question open the yes executes the offer; with none,
+    # the unevidenced commit is dropped and a stray yes books NOTHING.
+    # Stubbed in-process - no network, still deterministic.
+    import agent as _agent_mod
+    _prev_extract = _agent_mod._perception_extract
+
+    def _llmish(ev):
+        text = ev.get("text") or ev.get("caption") or ""
+        out = _agent_mod._extract(text)
+        if not out and _affirmative(text):
+            out = {"commit": True}
+        return out
+
+    _agent_mod._perception_extract = _llmish
+    try:
+        offer = [(0.0, {"kind": "chunk", "text": "flight from Delhi to Goa tomorrow", "final": True})]
+        stray = simulate({"name": "llm stray yes", "multimodal": False, "faults": set(),
+                          "events": offer + [(2.0, {"kind": "chunk", "text": "no thanks", "final": True}),
+                                             (3.5, {"kind": "chunk", "text": "yes", "final": True})]})
+        assert not _out(stray, CALL, "book_flight"), \
+            "LLM mapping yes->commit must not let a stray yes book"
+        answered = simulate({"name": "llm yes to offer", "multimodal": False, "faults": set(),
+                             "events": offer + [(2.0, {"kind": "chunk", "text": "yes", "final": True})]})
+        books = _out(answered, CALL, "book_flight")
+        assert len(books) == 1 and books[0]["args"]["flight_id"] == "GOA-101", \
+            "with a question open, the LLM-mode yes must still execute the offer"
+    finally:
+        _agent_mod._perception_extract = _prev_extract
 
     # the exported trace is JSON-clean and in the exact shape the visualiser
     # fetches: {"trace": [...]} with every entry serialisable as-is
