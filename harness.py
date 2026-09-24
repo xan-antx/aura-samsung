@@ -25,6 +25,7 @@ MANIFEST = {
     "search_flights":          {"mutating": False, "latency": 0.9},
     "check_seat_availability": {"mutating": False, "latency": 0.25},
     "book_flight":             {"mutating": True,  "latency": 1.1},
+    "cancel_booking":          {"mutating": True,  "latency": 0.6},
     "create_ticket":           {"mutating": True,  "latency": 0.8},
 }
 
@@ -53,6 +54,8 @@ def run_tool(tool: str, args: dict, attempt: int, faults: set) -> dict:
         # sha256 over canonical args, like _idem - never built-in hash(), which
         # is seed-randomised per process and would break trace determinism
         return {"ok": True, "booking_ref": f"PNR{int(_idem(tool, args), 16) % 10000:04d}"}
+    if tool == "cancel_booking":
+        return {"ok": True, "cancelled": args["booking_ref"]}
     return {"ok": True}
 
 
@@ -240,6 +243,111 @@ SCENARIOS = [
                    "slots": {"origin": "delhi", "destination": "pune",
                              "date": "2026-09-15", "commit": True}},
     },
+    {
+        # No flight intent, no slots. The agent must state its capability and
+        # ask - never "I haven't got anything back yet", which implies work
+        # happened that it cannot do.
+        "name": "out-of-domain input states capability",
+        "blurb": "Asked about the weather, it says what it can do - search and book flights - and asks where to. It never pretends to have done something.",
+        "multimodal": False,
+        "faults": set(),
+        "events": [
+            (0.0, {"kind": "chunk", "text": "what's the weather like in Goa this weekend", "final": True}),
+        ],
+        "expect": {"tools_ok": set(), "cancels": 0, "clarify": True, "slots": {}},
+    },
+    {
+        "name": "out-of-domain then recovery",
+        "blurb": "After an off-topic ask it steers back politely, and the very next request books end to end.",
+        "multimodal": False,
+        "faults": set(),
+        "events": [
+            (0.0, {"kind": "chunk", "text": "can you order me a pizza", "final": True}),
+            (2.0, {"kind": "chunk", "text": "okay then book me a flight from Delhi to Goa tomorrow", "final": True}),
+        ],
+        "expect": {"tools_ok": {"search_flights", "check_seat_availability", "book_flight"},
+                   "cancels": 0, "clarify": True,
+                   "slots": {"origin": "delhi", "destination": "goa",
+                             "date": "2026-09-15", "commit": True},
+                   "called_with": [("book_flight", {"flight_id": "GOA-101"})]},
+    },
+    {
+        # The agent asked "Want me to book GOA-101?" - a bare "yes" must
+        # execute exactly that offer, through the normal commit gate + grace.
+        "name": "yes to a book offer books that flight",
+        "blurb": "It offers to book the flight it found; a plain 'yes' is enough to book exactly that flight.",
+        "multimodal": False,
+        "faults": set(),
+        "events": [
+            (0.0, {"kind": "chunk", "text": "flight from Delhi to Goa tomorrow", "final": True}),
+            (2.0, {"kind": "chunk", "text": "yes please", "final": True}),
+        ],
+        "expect": {"tools_ok": {"search_flights", "check_seat_availability", "book_flight"},
+                   "cancels": 0,
+                   "slots": {"origin": "delhi", "destination": "goa",
+                             "date": "2026-09-15", "commit": True},
+                   "called_with": [("book_flight", {"flight_id": "GOA-101"})]},
+    },
+    {
+        # "no" declines and is acknowledged without acting; a later stray
+        # "yes" (question already resolved) must never book anything.
+        "name": "no declines; a stray yes books nothing",
+        "blurb": "Decline the offer and nothing is booked; a stray 'yes' later still books nothing - answers only count against a live question.",
+        "multimodal": False,
+        "faults": set(),
+        "events": [
+            (0.0, {"kind": "chunk", "text": "flight from Delhi to Goa tomorrow", "final": True}),
+            (2.0, {"kind": "chunk", "text": "no thanks", "final": True}),
+            (3.5, {"kind": "chunk", "text": "yes", "final": True}),
+        ],
+        "expect": {"tools_ok": {"search_flights", "check_seat_availability"},
+                   "cancels": 0,
+                   "slots": {"origin": "delhi", "destination": "goa",
+                             "date": "2026-09-15"},
+                   "never_called_with": [("book_flight", {"flight_id": "GOA-101"})]},
+    },
+    {
+        # Past the revision cap the agent asks "destination is pune, correct?"
+        # - a bare "yes" confirms, de-escalates, and unblocks the booking.
+        "name": "yes to a slot confirmation unblocks the booking",
+        "blurb": "After two rapid corrections it asks to confirm; a plain 'yes' unblocks the booking on the confirmed city.",
+        "multimodal": False,
+        "faults": set(),
+        "events": [
+            (0.0, {"kind": "chunk", "text": "flight from Delhi to Mumbai tomorrow"}),
+            (0.5, {"kind": "interrupt", "text": "no to Goa"}),
+            (1.0, {"kind": "interrupt", "text": "actually to Pune"}),
+            (2.5, {"kind": "chunk", "text": "book it", "final": True}),
+            (3.5, {"kind": "chunk", "text": "yes", "final": True}),
+        ],
+        "expect": {"tools_ok": {"search_flights", "check_seat_availability", "book_flight"},
+                   "cancels": 2, "clarify": True,
+                   "slots": {"origin": "delhi", "destination": "pune",
+                             "date": "2026-09-15", "commit": True},
+                   "called_with": [("book_flight", {"flight_id": "PUN-101"})]},
+    },
+    {
+        # "shall I cancel it?" is a real offer now: "yes" cancels exactly the
+        # superseded booking via the mutating cancel_booking tool, and a
+        # second "yes" cannot cancel twice (question cleared + idempotency).
+        "name": "yes to the cancel offer cancels the superseded booking once",
+        "blurb": "Say yes to 'shall I cancel it?' and the old booking is actually cancelled - once, with its reference confirmed; a second yes does nothing.",
+        "multimodal": False,
+        "faults": set(),
+        "events": [
+            (0.0, {"kind": "chunk", "text": "flight from Delhi to Mumbai tomorrow"}),
+            (1.5, {"kind": "chunk", "text": "book it", "final": True}),
+            (5.0, {"kind": "chunk", "text": "wait, to Goa instead", "final": True}),
+            (9.0, {"kind": "chunk", "text": "yes", "final": True}),
+            (11.0, {"kind": "chunk", "text": "yes", "final": True}),
+        ],
+        "expect": {"tools_ok": {"search_flights", "check_seat_availability",
+                                "book_flight", "cancel_booking"},
+                   "cancels": 0,
+                   "slots": {"origin": "delhi", "destination": "goa",
+                             "date": "2026-09-15", "commit": True},
+                   "called_with": [("cancel_booking", {"booking_ref": "PNR5797"})]},
+    },
 ]
 
 # --- known gap, not fixed here (out of scope for harness.py) ----------------
@@ -404,7 +512,14 @@ def score(scn, run) -> tuple[float, list[str]]:
             and e["call_id"] not in run["cancelled"]]
     for o in outs:
         if o["kind"] == FINAL and o.get("booked"):
-            prior = [e for e in live if e["t"] <= o["t"]]
+            # a superseded booking that has since been cancelled is resolved,
+            # not undisclosed - it no longer needs naming
+            gone = {e["result"]["cancelled"] for e in trace
+                    if e["dir"] == "in" and e["kind"] == "tool_result"
+                    and e.get("tool") == "cancel_booking"
+                    and e["result"].get("ok") and e["t"] <= o["t"]}
+            prior = [e for e in live if e["t"] <= o["t"]
+                     and e["result"]["booking_ref"] not in gone]
             for e in prior[:-1]:
                 fid = e["args"].get("flight_id", "")
                 if fid and fid not in o.get("text", ""):
@@ -532,8 +647,11 @@ def main(quiet=False):
     return totals
 
 
-# sha256 of the serialized export - see the determinism pin in _selfcheck
-EXPORT_DIGEST = "197292b9d504b6f40dd5838ad9af23b221df962010b420fc8d11d8a6ce4c2549"
+# sha256 of the serialized export - see the determinism pin in _selfcheck.
+# Updated deliberately 2026-09-24 (second time): pending-question answers
+# ("yes"/"no" resolve the agent's own offers) and the real cancel_booking
+# tool added four scenarios.
+EXPORT_DIGEST = "f6bc72eaf5deabb880d753a31f1df989f28af9684aa665e6e75899432ccffddf"
 
 
 def _selfcheck():
@@ -650,6 +768,59 @@ def _selfcheck():
     # and the record itself survives in done - the ledger and the disclosure agree
     assert any(c.mutating and c.superseded and c.args["flight_id"] == "MUM-101"
                and c.result["booking_ref"] for c in twice["agent"].done.values())
+
+    # out-of-domain input: capability statement + a question, no fake progress,
+    # no tool fired
+    ood = simulate(SCENARIOS[10])
+    clar = _out(ood, CLARIFY)
+    assert clar and "search for and book flights" in clar[0]["text"], clar
+    assert not _out(ood, CALL), "no tool may fire on out-of-domain input"
+    assert not any("haven't got anything back" in (o.get("text") or "")
+                   for o in _out(ood, FINAL) + clar)
+
+    # finals carry their content: found-flights final names the flights, the
+    # seats, and invites the booking; a booked final names flight and ref
+    fin = _out(simulate(SCENARIOS[3]), FINAL)[-1]
+    assert "GOA-101" in fin["text"] and "GOA-204" in fin["text"] \
+        and "Want me to book GOA-101?" in fin["text"], fin["text"]
+    booked_fin = _out(simulate(SCENARIOS[1]), FINAL)[-1]
+    assert "CHE-101" in booked_fin["text"] and "PNR" in booked_fin["text"], booked_fin["text"]
+
+    # pending questions: a bare "yes" executes exactly the offered thing,
+    # through the normal commit gate and grace window
+    yes = simulate(SCENARIOS[12])
+    books = _out(yes, CALL, "book_flight")
+    assert len(books) == 1 and books[0]["args"]["flight_id"] == "GOA-101", books
+    assert books[0]["t"] >= 2.0 + Agent.GRACE, \
+        f"affirmed booking must still wait out the grace window: {books[0]['t']}"
+
+    # "no" acknowledges without acting; a stray "yes" afterwards books nothing,
+    # and the declined offer is never re-asked
+    no = simulate(SCENARIOS[13])
+    assert not _out(no, CALL, "book_flight"), "declined offer must not book"
+    assert any(o["kind"] == SAY and "leave it" in o["text"] for o in no["trace"]
+               if o["dir"] == "out"), "a negative deserves an acknowledgment"
+    assert "Want me to book" not in _out(no, FINAL)[-1]["text"], \
+        "a declined offer must not be re-asked"
+
+    # "yes" to a slot confirmation de-escalates and unblocks the booking
+    conf = simulate(SCENARIOS[14])
+    books = _out(conf, CALL, "book_flight")
+    assert len(books) == 1 and books[0]["args"]["flight_id"] == "PUN-101" \
+        and books[0]["t"] >= 3.5, books
+
+    # "yes" to the cancel offer cancels exactly the superseded booking, once;
+    # the final confirms it by reference and stops re-offering
+    canc = simulate(SCENARIOS[15])
+    cuts = _out(canc, CALL, "cancel_booking")
+    mum_ref = next(e["result"]["booking_ref"] for e in canc["trace"]
+                   if e["dir"] == "in" and e["kind"] == "tool_result"
+                   and e.get("tool") == "book_flight" and "MUM" in str(e["args"]))
+    assert len(cuts) == 1 and cuts[0]["args"]["booking_ref"] == mum_ref, cuts
+    assert cuts[0]["mutating"] and cuts[0]["idem_key"], "cancel must be idempotency-keyed"
+    last = _out(canc, FINAL)[-1]["text"]
+    assert f"Cancelled your earlier booking MUM-101 (ref {mum_ref})" in last, last
+    assert "shall I cancel" not in last, "resolved offer must not be re-asked"
 
     # the exported trace is JSON-clean and in the exact shape the visualiser
     # fetches: {"trace": [...]} with every entry serialisable as-is

@@ -118,6 +118,28 @@ def _sense(ev: dict) -> dict:
     return _extract(ev.get("text") or ev.get("caption") or "")
 
 
+# Deterministic yes/no detection for answers to the agent's own questions -
+# coordinator-side, like repair cues, so it works with or without an LLM.
+_AFFIRM = {"yes", "yeah", "yep", "sure", "ok", "okay"}
+_NEG = {"no", "nope", "nah"}
+
+
+def _clean_words(text: str) -> list[str]:
+    return [w.strip(".,!?-'") for w in text.lower().split()]
+
+
+def _affirmative(text: str) -> bool:
+    words = _clean_words(text)
+    return bool(words) and (words[0] in _AFFIRM
+                            or "go ahead" in " ".join(words) or "do it" in " ".join(words))
+
+
+def _negative(text: str) -> bool:
+    words = _clean_words(text)
+    return bool(words) and (words[0] in _NEG
+                            or "don't" in words or "never mind" in " ".join(words))
+
+
 REPAIR_CUES = {"actually", "wait", "sorry", "no"}
 
 
@@ -155,7 +177,11 @@ class Agent:
         self.repair_cue_at = -1e9               # last "wait/actually/sorry/no/make that"
         self.wake_at: float | None = None       # deferred mutating call may fire here
         self.deferred: tuple | None = None      # (tool, args, reads, key, gate) held back
-        self.pending_confirm: str | None = None # slot past the revision cap, awaiting answer
+        self.pending_q: dict | None = None      # the question on the floor, with its
+                                                # exact target: {"kind": "book"|"confirm_slot"
+                                                # |"cancel", ...}. One at a time.
+        self.declined: set[str] = set()         # question signatures never re-asked
+        self.cancel_approved: dict | None = None  # affirmed cancel offer awaiting execution
         self.pending_perception = 0
         self._n = 0
 
@@ -197,12 +223,61 @@ class Agent:
         text = ev.get("text", "")
         if _repair_cue(text):
             self.repair_cue_at = now               # freeze mutations: correction incoming
-        changed = self._apply(_sense(ev), now)
+        changed = self._apply(_sense(ev), now)     # may itself resolve a slot confirmation
         acts = self._invalidate(changed, now)          # cancel stale work FIRST
+        acts += self._answer(changed, text, now)       # then resolve the pending question
         acts += self._plan(now)
         if ev.get("final"):
             acts += self._finalise(now)
         return acts
+
+    def _answer(self, changed: set, text: str, now: float) -> list[Action]:
+        """Resolve the user's turn against the pending question. The decision
+        comes from the deterministic yes/no detectors on the RAW TEXT - never
+        from what extraction returned, so an LLM that maps "yes" to
+        {"commit": true} resolves identically to the keyword path. Runs after
+        _apply/_invalidate: a mention of the confirmed slot has already
+        resolved the question there, and a real slot change has already
+        purged any chain the offer depended on."""
+        q = self.pending_q
+        if q is None:
+            return []                              # a stray "yes" answers nothing
+        if _affirmative(text):
+            self.pending_q = None
+            if q["kind"] == "confirm_slot":
+                if self.slots.get(q["slot"]) == q["value"]:
+                    self.meta[q["slot"]].revision_count = 1   # confirmed: de-escalate
+                    self.commit_at = now           # a fresh go-signal restarts the grace clock
+            elif q["kind"] == "book":
+                seats = self._latest("check_seat_availability", "seats")
+                if seats and seats.result["flight_id"] == q["flight_id"]:
+                    # the offered thing IS a commit; the booking still passes
+                    # the normal commit gate and grace window in _plan
+                    self._apply({"commit": True}, now)
+                # else: the offer's chain was invalidated just above - the
+                # now-stale offer is dropped and the planner starts over
+            elif q["kind"] == "cancel":
+                self.commit_at = now
+                self.cancel_approved = {"booking_ref": q["booking_ref"]}
+            return []
+        if _negative(text):
+            self.pending_q = None
+            self.declined.add(
+                f"book:{q['flight_id']}" if q["kind"] == "book"
+                else f"cancel:{q['booking_ref']}" if q["kind"] == "cancel"
+                else f"confirm:{q['slot']}:{q['value']}")
+            if q["kind"] == "confirm_slot":
+                # "no" to "is it pune?" means the value is wrong: ask for it
+                return [Action(CLARIFY, now, {
+                    "text": f"Which {q['slot']} should I use, then?",
+                    "missing": [q["slot"]], "state": self.snapshot()})]
+            return [self._say("Okay, I'll leave it.", now)]
+        if changed - {"commit"}:
+            # Supersession needs a REAL slot change (intent counts only when
+            # it actually changed; `changed` never holds unchanged keys).
+            # Extracting {"commit": true} from an answer is not new content.
+            self.pending_q = None
+        return []                                  # otherwise the question stays open
 
     def _on_perception(self, ev, now) -> list[Action]:
         """Acknowledge on the fast path, process on the slow path.
@@ -216,6 +291,8 @@ class Agent:
             acts.append(self._say("Let me take a look at that.", now))
         self.pending_perception += 1
         changed = self._apply(_sense(ev), now)
+        if changed - {"commit"} and self.pending_q:
+            self.pending_q = None                  # new perceived content supersedes it
         acts += self._invalidate(changed, now)
         acts += self._plan(now)
         self.pending_perception -= 1
@@ -252,11 +329,12 @@ class Agent:
                 else:
                     m.last_changed_at = now
                     m.revision_count += 1
-            if k == self.pending_confirm:
+            q = self.pending_q
+            if q and q.get("kind") == "confirm_slot" and k == q["slot"]:
                 # any answer naming the slot resolves the clarify - a repeat
                 # confirms, a new value IS the answer. Either way, de-escalate.
                 self.meta[k].revision_count = 1
-                self.pending_confirm = None
+                self.pending_q = None
         if extracted.get("commit"):
             self.commit_at = now        # every "book it" restarts the grace clock
         return changed
@@ -335,6 +413,19 @@ class Agent:
                                       "seat": seats.result["seats"][0],
                                       "pax": self.slots.get("pax", 1)},
                                      reads, now)
+
+        # An approved cancel offer: fires ONLY on an explicit affirmative to
+        # the pending cancel question - never inferred, never automatic. It
+        # is mutating, so it rides the same idempotency key and grace gate as
+        # every mutation. reads is empty on purpose: it targets a past
+        # booking by ref, so no live slot change can invalidate it.
+        if self.cancel_approved:
+            ref = self.cancel_approved["booking_ref"]
+            if any(c.tool == "cancel_booking" and c.result and c.result.get("ok")
+                   and c.result.get("cancelled") == ref for c in self.done.values()):
+                self.cancel_approved = None            # executed; never twice
+            else:
+                acts += self._ensure("cancel_booking", {"booking_ref": ref}, set(), now)
         return acts
 
     def _latest(self, tool: str, field: str) -> Call | None:
@@ -363,12 +454,13 @@ class Agent:
     def _confirm(self, slot: str, now: float) -> list[Action]:
         """Past the escalation cap the user is telling us they're not sure.
         A longer dwell would punish exactly them - clarify instead."""
-        if self.pending_confirm:
-            return []                                    # already on the floor
-        self.pending_confirm = slot
+        value = self.slots[slot]
+        if self.pending_q or f"confirm:{slot}:{value}" in self.declined:
+            return []                                    # already asked, or already refused
+        self.pending_q = {"kind": "confirm_slot", "slot": slot, "value": value}
         return [Action(CLARIFY, now, {
-            "text": f"Just to confirm - {slot} is {self.slots[slot]}, correct?",
-            "confirm": {slot: self.slots[slot]}, "state": self.snapshot()})]
+            "text": f"Just to confirm - {slot} is {value}, correct?",
+            "confirm": {slot: value}, "state": self.snapshot()})]
 
     def _ensure(self, tool: str, args: dict, reads: set, now: float) -> list[Action]:
         """Issue a call unless it is already running or already committed."""
@@ -432,13 +524,22 @@ class Agent:
     # -- turn end ----------------------------------------------------------
 
     def _finalise(self, now: float) -> list[Action]:
+        if self.slots.get("intent") != "flight" and not self.done and not self.inflight:
+            # Out of domain: say what we can do and ask, never imply we did
+            # something we can't. This is a question, so it goes out as a
+            # clarify, not a final.
+            return [Action(CLARIFY, now, {
+                "text": "I can search for and book flights - that's all I do. "
+                        "Where would you like to fly?",
+                "missing": ["destination"], "state": self.snapshot()})]
+
         missing = {"origin", "destination", "date"} - set(self.slots)
         if self.slots.get("intent") == "flight" and missing:
             return [Action(CLARIFY, now, {
                 "text": f"Which {sorted(missing)[0]} should I use?",
                 "missing": sorted(missing), "state": self.snapshot()})]
 
-        if self.pending_confirm:
+        if self.pending_q and self.pending_q["kind"] == "confirm_slot":
             return []                                    # a clarify is already on the floor
 
         if self.deferred is not None:
@@ -458,20 +559,56 @@ class Agent:
         bookings = [c for c in self.done.values()
                     if c.mutating and c.result.get("ok") and c.result.get("booking_ref")]
         booked = any(not c.superseded for c in bookings)
-        text = ("You're booked." if booked else
-                "Here's what I found." if self.done else
-                "I haven't got anything back yet.")
+        # A final carries its content: name the booking, or name what was
+        # found and invite the next step. Completion claims stay tied to a
+        # real booking reference (rule 2); the text just stops being empty.
+        if booked:
+            b = max((c for c in bookings if not c.superseded), key=lambda c: c.issued_at)
+            seat = str(b.args.get("seat") or "").split(":")[-1]
+            text = (f"You're booked on {b.args['flight_id']}"
+                    + (f", seat {seat}" if seat else "")
+                    + f" - ref {b.result['booking_ref']}.")
+        else:
+            search = self._latest("search_flights", "flights")
+            seats = self._latest("check_seat_availability", "seats")
+            if search:
+                flights = search.result["flights"]
+                text = f"I found {len(flights)} flights: {', '.join(flights)}."
+                if seats:
+                    text += f" {len(seats.result['seats'])} seats free on {seats.result['flight_id']}."
+                # one question per final, and never re-ask a declined offer
+                if f"book:{flights[0]}" not in self.declined:
+                    text += f" Want me to book {flights[0]}?"
+                    self.pending_q = {"kind": "book", "flight_id": flights[0]}
+            elif self.done:
+                text = "Here's what I found."
+            else:
+                text = "I haven't got anything back yet."
         payload = {"text": text, "state": self.snapshot(), "booked": booked}
+
+        cancelled_refs = {c.result.get("cancelled") for c in self.done.values()
+                          if c.tool == "cancel_booking" and c.result.get("ok")}
         stale = [c for c in bookings if c.superseded]
-        if stale:
+        open_stale = [c for c in stale if c.result["booking_ref"] not in cancelled_refs]
+        if open_stale:
             # Truthfulness over tidiness: a superseded booking is still real.
-            # Name it and offer the fix; never let "You're booked" imply there
-            # is exactly one booking when there are two.
+            # Name it, and offer the fix only if we can still keep the offer
+            # and no other question is already on the floor this turn.
             names = " and ".join(f"{c.args['flight_id']} (ref {c.result['booking_ref']})"
-                                 for c in stale)
-            payload["text"] += f" Your earlier booking {names} is still active - shall I cancel it?"
+                                 for c in open_stale)
+            ref0 = open_stale[0].result["booking_ref"]
+            if self.pending_q is None and f"cancel:{ref0}" not in self.declined:
+                payload["text"] += f" Your earlier booking {names} is still active - shall I cancel it?"
+                self.pending_q = {"kind": "cancel", "booking_ref": ref0,
+                                  "flight_id": open_stale[0].args["flight_id"]}
+            else:
+                payload["text"] += f" Your earlier booking {names} is still active."
             payload["superseded"] = [{"flight_id": c.args["flight_id"],
-                                      "booking_ref": c.result["booking_ref"]} for c in stale]
+                                      "booking_ref": c.result["booking_ref"]} for c in open_stale]
+        for c in stale:
+            if c.result["booking_ref"] in cancelled_refs:
+                payload["text"] += (f" Cancelled your earlier booking "
+                                    f"{c.args['flight_id']} (ref {c.result['booking_ref']}).")
         return [Action(FINAL, now, payload)]
 
     def _say(self, text: str, now: float) -> Action:

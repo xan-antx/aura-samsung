@@ -186,7 +186,7 @@
         }
       },
       "t": 3.9,
-      "text": "You're booked."
+      "text": "You're booked on GOA-101, seat 12A - ref PNR7240."
     }
   ],
   "scenarios": [
@@ -381,7 +381,7 @@
             }
           },
           "t": 3.9,
-          "text": "You're booked."
+          "text": "You're booked on GOA-101, seat 12A - ref PNR7240."
         }
       ]
     },
@@ -544,7 +544,7 @@
             }
           },
           "t": 3.5,
-          "text": "You're booked."
+          "text": "You're booked on CHE-101, seat 12A - ref PNR7287."
         }
       ]
     },
@@ -727,7 +727,7 @@
             }
           },
           "t": 3.0,
-          "text": "Here's what I found."
+          "text": "I found 2 flights: GOA-101, GOA-204. 2 seats free on GOA-101. Want me to book GOA-101?"
         }
       ]
     },
@@ -885,7 +885,7 @@
             }
           },
           "t": 4.0,
-          "text": "You're booked."
+          "text": "You're booked on PUN-101, seat 12A - ref PNR4559."
         }
       ]
     },
@@ -1133,7 +1133,7 @@
             }
           },
           "t": 3.45,
-          "text": "You're booked."
+          "text": "You're booked on GOA-101, seat 12A - ref PNR5331."
         }
       ]
     },
@@ -1381,7 +1381,7 @@
             }
           },
           "t": 4.25,
-          "text": "You're booked."
+          "text": "You're booked on GOA-101, seat 12A - ref PNR5331."
         }
       ]
     },
@@ -1575,7 +1575,7 @@
             }
           },
           "t": 4.0,
-          "text": "You're booked."
+          "text": "You're booked on GOA-101, seat 12A - ref PNR5331."
         }
       ]
     },
@@ -1727,7 +1727,7 @@
             }
           },
           "t": 3.0,
-          "text": "You're booked."
+          "text": "You're booked on MUM-101, seat 12A - ref PNR5797."
         },
         {
           "dir": "in",
@@ -1871,7 +1871,7 @@
             }
           ],
           "t": 7.25,
-          "text": "You're booked. Your earlier booking MUM-101 (ref PNR5797) is still active - shall I cancel it?"
+          "text": "You're booked on GOA-101, seat 12A - ref PNR5331. Your earlier booking MUM-101 (ref PNR5797) is still active - shall I cancel it?"
         }
       ]
     },
@@ -2074,6 +2074,1157 @@
           },
           "t": 3.0,
           "text": "Just to confirm - destination is pune, correct?"
+        }
+      ]
+    },
+    {
+      "name": "out-of-domain input states capability",
+      "blurb": "Asked about the weather, it says what it can do - search and book flights - and asks where to. It never pretends to have done something.",
+      "multimodal": false,
+      "score": 100.0,
+      "trace": [
+        {
+          "dir": "in",
+          "t": 0.0,
+          "kind": "chunk",
+          "text": "what's the weather like in Goa this weekend",
+          "final": true
+        },
+        {
+          "dir": "out",
+          "kind": "clarify",
+          "missing": [
+            "destination"
+          ],
+          "state": {
+            "intent": null,
+            "slots": {}
+          },
+          "t": 0.0,
+          "text": "I can search for and book flights - that's all I do. Where would you like to fly?"
+        }
+      ]
+    },
+    {
+      "name": "out-of-domain then recovery",
+      "blurb": "After an off-topic ask it steers back politely, and the very next request books end to end.",
+      "multimodal": false,
+      "score": 100.0,
+      "trace": [
+        {
+          "dir": "in",
+          "t": 0.0,
+          "kind": "chunk",
+          "text": "can you order me a pizza",
+          "final": true
+        },
+        {
+          "dir": "out",
+          "kind": "clarify",
+          "missing": [
+            "destination"
+          ],
+          "state": {
+            "intent": null,
+            "slots": {}
+          },
+          "t": 0.0,
+          "text": "I can search for and book flights - that's all I do. Where would you like to fly?"
+        },
+        {
+          "dir": "in",
+          "t": 2.0,
+          "kind": "chunk",
+          "text": "okay then book me a flight from Delhi to Goa tomorrow",
+          "final": true
+        },
+        {
+          "dir": "out",
+          "args": {
+            "date": "2026-09-15",
+            "destination": "goa",
+            "origin": "delhi"
+          },
+          "call_id": "c1",
+          "idem_key": null,
+          "kind": "call",
+          "mutating": false,
+          "reads": [
+            "date",
+            "destination",
+            "origin"
+          ],
+          "t": 2.0,
+          "tool": "search_flights"
+        },
+        {
+          "dir": "out",
+          "kind": "say",
+          "t": 2.0,
+          "text": "One moment, checking that now."
+        },
+        {
+          "dir": "in",
+          "t": 2.9,
+          "kind": "tool_result",
+          "call_id": "c1",
+          "tool": "search_flights",
+          "args": {
+            "origin": "delhi",
+            "destination": "goa",
+            "date": "2026-09-15"
+          },
+          "result": {
+            "ok": true,
+            "flights": [
+              "GOA-101",
+              "GOA-204"
+            ]
+          }
+        },
+        {
+          "dir": "out",
+          "args": {
+            "flight_id": "GOA-101"
+          },
+          "call_id": "c2",
+          "idem_key": null,
+          "kind": "call",
+          "mutating": false,
+          "reads": [
+            "date",
+            "destination",
+            "origin"
+          ],
+          "t": 2.9,
+          "tool": "check_seat_availability"
+        },
+        {
+          "dir": "in",
+          "t": 3.15,
+          "kind": "tool_result",
+          "call_id": "c2",
+          "tool": "check_seat_availability",
+          "args": {
+            "flight_id": "GOA-101"
+          },
+          "result": {
+            "ok": true,
+            "flight_id": "GOA-101",
+            "seats": [
+              "GOA-101:12A",
+              "GOA-101:14C"
+            ]
+          }
+        },
+        {
+          "dir": "out",
+          "args": {
+            "flight_id": "GOA-101",
+            "pax": 1,
+            "seat": "GOA-101:12A"
+          },
+          "call_id": "c3",
+          "idem_key": "8a070bfa479d5fe3",
+          "kind": "call",
+          "mutating": true,
+          "reads": [
+            "date",
+            "destination",
+            "origin",
+            "pax"
+          ],
+          "t": 3.15,
+          "tool": "book_flight"
+        },
+        {
+          "dir": "in",
+          "t": 4.25,
+          "kind": "tool_result",
+          "call_id": "c3",
+          "tool": "book_flight",
+          "args": {
+            "flight_id": "GOA-101",
+            "seat": "GOA-101:12A",
+            "pax": 1
+          },
+          "result": {
+            "ok": true,
+            "booking_ref": "PNR5331"
+          }
+        },
+        {
+          "dir": "out",
+          "booked": true,
+          "kind": "final",
+          "state": {
+            "intent": "flight",
+            "slots": {
+              "commit": true,
+              "date": "2026-09-15",
+              "destination": "goa",
+              "origin": "delhi"
+            }
+          },
+          "t": 4.25,
+          "text": "You're booked on GOA-101, seat 12A - ref PNR5331."
+        }
+      ]
+    },
+    {
+      "name": "yes to a book offer books that flight",
+      "blurb": "It offers to book the flight it found; a plain 'yes' is enough to book exactly that flight.",
+      "multimodal": false,
+      "score": 100.0,
+      "trace": [
+        {
+          "dir": "in",
+          "t": 0.0,
+          "kind": "chunk",
+          "text": "flight from Delhi to Goa tomorrow",
+          "final": true
+        },
+        {
+          "dir": "out",
+          "args": {
+            "date": "2026-09-15",
+            "destination": "goa",
+            "origin": "delhi"
+          },
+          "call_id": "c1",
+          "idem_key": null,
+          "kind": "call",
+          "mutating": false,
+          "reads": [
+            "date",
+            "destination",
+            "origin"
+          ],
+          "t": 0.0,
+          "tool": "search_flights"
+        },
+        {
+          "dir": "out",
+          "kind": "say",
+          "t": 0.0,
+          "text": "One moment, checking that now."
+        },
+        {
+          "dir": "in",
+          "t": 0.9,
+          "kind": "tool_result",
+          "call_id": "c1",
+          "tool": "search_flights",
+          "args": {
+            "origin": "delhi",
+            "destination": "goa",
+            "date": "2026-09-15"
+          },
+          "result": {
+            "ok": true,
+            "flights": [
+              "GOA-101",
+              "GOA-204"
+            ]
+          }
+        },
+        {
+          "dir": "out",
+          "args": {
+            "flight_id": "GOA-101"
+          },
+          "call_id": "c2",
+          "idem_key": null,
+          "kind": "call",
+          "mutating": false,
+          "reads": [
+            "date",
+            "destination",
+            "origin"
+          ],
+          "t": 0.9,
+          "tool": "check_seat_availability"
+        },
+        {
+          "dir": "in",
+          "t": 1.15,
+          "kind": "tool_result",
+          "call_id": "c2",
+          "tool": "check_seat_availability",
+          "args": {
+            "flight_id": "GOA-101"
+          },
+          "result": {
+            "ok": true,
+            "flight_id": "GOA-101",
+            "seats": [
+              "GOA-101:12A",
+              "GOA-101:14C"
+            ]
+          }
+        },
+        {
+          "dir": "out",
+          "booked": false,
+          "kind": "final",
+          "state": {
+            "intent": "flight",
+            "slots": {
+              "date": "2026-09-15",
+              "destination": "goa",
+              "origin": "delhi"
+            }
+          },
+          "t": 1.15,
+          "text": "I found 2 flights: GOA-101, GOA-204. 2 seats free on GOA-101. Want me to book GOA-101?"
+        },
+        {
+          "dir": "in",
+          "t": 2.0,
+          "kind": "chunk",
+          "text": "yes please",
+          "final": true
+        },
+        {
+          "dir": "out",
+          "args": {
+            "flight_id": "GOA-101",
+            "pax": 1,
+            "seat": "GOA-101:12A"
+          },
+          "call_id": "c3",
+          "idem_key": "8a070bfa479d5fe3",
+          "kind": "call",
+          "mutating": true,
+          "reads": [
+            "date",
+            "destination",
+            "origin",
+            "pax"
+          ],
+          "t": 2.4,
+          "tool": "book_flight"
+        },
+        {
+          "dir": "in",
+          "t": 3.5,
+          "kind": "tool_result",
+          "call_id": "c3",
+          "tool": "book_flight",
+          "args": {
+            "flight_id": "GOA-101",
+            "seat": "GOA-101:12A",
+            "pax": 1
+          },
+          "result": {
+            "ok": true,
+            "booking_ref": "PNR5331"
+          }
+        },
+        {
+          "dir": "out",
+          "booked": true,
+          "kind": "final",
+          "state": {
+            "intent": "flight",
+            "slots": {
+              "commit": true,
+              "date": "2026-09-15",
+              "destination": "goa",
+              "origin": "delhi"
+            }
+          },
+          "t": 3.5,
+          "text": "You're booked on GOA-101, seat 12A - ref PNR5331."
+        }
+      ]
+    },
+    {
+      "name": "no declines; a stray yes books nothing",
+      "blurb": "Decline the offer and nothing is booked; a stray 'yes' later still books nothing - answers only count against a live question.",
+      "multimodal": false,
+      "score": 100.0,
+      "trace": [
+        {
+          "dir": "in",
+          "t": 0.0,
+          "kind": "chunk",
+          "text": "flight from Delhi to Goa tomorrow",
+          "final": true
+        },
+        {
+          "dir": "out",
+          "args": {
+            "date": "2026-09-15",
+            "destination": "goa",
+            "origin": "delhi"
+          },
+          "call_id": "c1",
+          "idem_key": null,
+          "kind": "call",
+          "mutating": false,
+          "reads": [
+            "date",
+            "destination",
+            "origin"
+          ],
+          "t": 0.0,
+          "tool": "search_flights"
+        },
+        {
+          "dir": "out",
+          "kind": "say",
+          "t": 0.0,
+          "text": "One moment, checking that now."
+        },
+        {
+          "dir": "in",
+          "t": 0.9,
+          "kind": "tool_result",
+          "call_id": "c1",
+          "tool": "search_flights",
+          "args": {
+            "origin": "delhi",
+            "destination": "goa",
+            "date": "2026-09-15"
+          },
+          "result": {
+            "ok": true,
+            "flights": [
+              "GOA-101",
+              "GOA-204"
+            ]
+          }
+        },
+        {
+          "dir": "out",
+          "args": {
+            "flight_id": "GOA-101"
+          },
+          "call_id": "c2",
+          "idem_key": null,
+          "kind": "call",
+          "mutating": false,
+          "reads": [
+            "date",
+            "destination",
+            "origin"
+          ],
+          "t": 0.9,
+          "tool": "check_seat_availability"
+        },
+        {
+          "dir": "in",
+          "t": 1.15,
+          "kind": "tool_result",
+          "call_id": "c2",
+          "tool": "check_seat_availability",
+          "args": {
+            "flight_id": "GOA-101"
+          },
+          "result": {
+            "ok": true,
+            "flight_id": "GOA-101",
+            "seats": [
+              "GOA-101:12A",
+              "GOA-101:14C"
+            ]
+          }
+        },
+        {
+          "dir": "out",
+          "booked": false,
+          "kind": "final",
+          "state": {
+            "intent": "flight",
+            "slots": {
+              "date": "2026-09-15",
+              "destination": "goa",
+              "origin": "delhi"
+            }
+          },
+          "t": 1.15,
+          "text": "I found 2 flights: GOA-101, GOA-204. 2 seats free on GOA-101. Want me to book GOA-101?"
+        },
+        {
+          "dir": "in",
+          "t": 2.0,
+          "kind": "chunk",
+          "text": "no thanks",
+          "final": true
+        },
+        {
+          "dir": "out",
+          "kind": "say",
+          "t": 2.0,
+          "text": "Okay, I'll leave it."
+        },
+        {
+          "dir": "out",
+          "booked": false,
+          "kind": "final",
+          "state": {
+            "intent": "flight",
+            "slots": {
+              "date": "2026-09-15",
+              "destination": "goa",
+              "origin": "delhi"
+            }
+          },
+          "t": 2.0,
+          "text": "I found 2 flights: GOA-101, GOA-204. 2 seats free on GOA-101."
+        },
+        {
+          "dir": "in",
+          "t": 3.5,
+          "kind": "chunk",
+          "text": "yes",
+          "final": true
+        },
+        {
+          "dir": "out",
+          "booked": false,
+          "kind": "final",
+          "state": {
+            "intent": "flight",
+            "slots": {
+              "date": "2026-09-15",
+              "destination": "goa",
+              "origin": "delhi"
+            }
+          },
+          "t": 3.5,
+          "text": "I found 2 flights: GOA-101, GOA-204. 2 seats free on GOA-101."
+        }
+      ]
+    },
+    {
+      "name": "yes to a slot confirmation unblocks the booking",
+      "blurb": "After two rapid corrections it asks to confirm; a plain 'yes' unblocks the booking on the confirmed city.",
+      "multimodal": false,
+      "score": 100.0,
+      "trace": [
+        {
+          "dir": "in",
+          "t": 0.0,
+          "kind": "chunk",
+          "text": "flight from Delhi to Mumbai tomorrow"
+        },
+        {
+          "dir": "out",
+          "args": {
+            "date": "2026-09-15",
+            "destination": "mumbai",
+            "origin": "delhi"
+          },
+          "call_id": "c1",
+          "idem_key": null,
+          "kind": "call",
+          "mutating": false,
+          "reads": [
+            "date",
+            "destination",
+            "origin"
+          ],
+          "t": 0.0,
+          "tool": "search_flights"
+        },
+        {
+          "dir": "out",
+          "kind": "say",
+          "t": 0.0,
+          "text": "One moment, checking that now."
+        },
+        {
+          "dir": "in",
+          "t": 0.5,
+          "kind": "interrupt",
+          "text": "no to Goa"
+        },
+        {
+          "dir": "out",
+          "call_id": "c1",
+          "invalidated_by": [
+            "destination"
+          ],
+          "kind": "cancel",
+          "reason": "superseded",
+          "t": 0.5
+        },
+        {
+          "dir": "out",
+          "kind": "say",
+          "supersedes_speech": true,
+          "t": 0.5,
+          "text": "Got it, updating that."
+        },
+        {
+          "dir": "out",
+          "args": {
+            "date": "2026-09-15",
+            "destination": "goa",
+            "origin": "delhi"
+          },
+          "call_id": "c2",
+          "idem_key": null,
+          "kind": "call",
+          "mutating": false,
+          "reads": [
+            "date",
+            "destination",
+            "origin"
+          ],
+          "t": 0.5,
+          "tool": "search_flights"
+        },
+        {
+          "dir": "in",
+          "t": 1.0,
+          "kind": "interrupt",
+          "text": "actually to Pune"
+        },
+        {
+          "dir": "out",
+          "call_id": "c2",
+          "invalidated_by": [
+            "destination"
+          ],
+          "kind": "cancel",
+          "reason": "superseded",
+          "t": 1.0
+        },
+        {
+          "dir": "out",
+          "kind": "say",
+          "supersedes_speech": true,
+          "t": 1.0,
+          "text": "Got it, updating that."
+        },
+        {
+          "dir": "out",
+          "args": {
+            "date": "2026-09-15",
+            "destination": "pune",
+            "origin": "delhi"
+          },
+          "call_id": "c3",
+          "idem_key": null,
+          "kind": "call",
+          "mutating": false,
+          "reads": [
+            "date",
+            "destination",
+            "origin"
+          ],
+          "t": 1.0,
+          "tool": "search_flights"
+        },
+        {
+          "dir": "in",
+          "t": 1.9,
+          "kind": "tool_result",
+          "call_id": "c3",
+          "tool": "search_flights",
+          "args": {
+            "origin": "delhi",
+            "destination": "pune",
+            "date": "2026-09-15"
+          },
+          "result": {
+            "ok": true,
+            "flights": [
+              "PUN-101",
+              "PUN-204"
+            ]
+          }
+        },
+        {
+          "dir": "out",
+          "args": {
+            "flight_id": "PUN-101"
+          },
+          "call_id": "c4",
+          "idem_key": null,
+          "kind": "call",
+          "mutating": false,
+          "reads": [
+            "date",
+            "destination",
+            "origin"
+          ],
+          "t": 1.9,
+          "tool": "check_seat_availability"
+        },
+        {
+          "dir": "in",
+          "t": 2.15,
+          "kind": "tool_result",
+          "call_id": "c4",
+          "tool": "check_seat_availability",
+          "args": {
+            "flight_id": "PUN-101"
+          },
+          "result": {
+            "ok": true,
+            "flight_id": "PUN-101",
+            "seats": [
+              "PUN-101:12A",
+              "PUN-101:14C"
+            ]
+          }
+        },
+        {
+          "dir": "in",
+          "t": 2.5,
+          "kind": "chunk",
+          "text": "book it",
+          "final": true
+        },
+        {
+          "dir": "out",
+          "confirm": {
+            "destination": "pune"
+          },
+          "kind": "clarify",
+          "state": {
+            "intent": "flight",
+            "slots": {
+              "commit": true,
+              "date": "2026-09-15",
+              "destination": "pune",
+              "origin": "delhi"
+            }
+          },
+          "t": 2.5,
+          "text": "Just to confirm - destination is pune, correct?"
+        },
+        {
+          "dir": "in",
+          "t": 3.5,
+          "kind": "chunk",
+          "text": "yes",
+          "final": true
+        },
+        {
+          "dir": "out",
+          "args": {
+            "flight_id": "PUN-101",
+            "pax": 1,
+            "seat": "PUN-101:12A"
+          },
+          "call_id": "c5",
+          "idem_key": "cc941967067eca5f",
+          "kind": "call",
+          "mutating": true,
+          "reads": [
+            "date",
+            "destination",
+            "origin",
+            "pax"
+          ],
+          "t": 3.9,
+          "tool": "book_flight"
+        },
+        {
+          "dir": "in",
+          "t": 5.0,
+          "kind": "tool_result",
+          "call_id": "c5",
+          "tool": "book_flight",
+          "args": {
+            "flight_id": "PUN-101",
+            "seat": "PUN-101:12A",
+            "pax": 1
+          },
+          "result": {
+            "ok": true,
+            "booking_ref": "PNR4559"
+          }
+        },
+        {
+          "dir": "out",
+          "booked": true,
+          "kind": "final",
+          "state": {
+            "intent": "flight",
+            "slots": {
+              "commit": true,
+              "date": "2026-09-15",
+              "destination": "pune",
+              "origin": "delhi"
+            }
+          },
+          "t": 5.0,
+          "text": "You're booked on PUN-101, seat 12A - ref PNR4559."
+        }
+      ]
+    },
+    {
+      "name": "yes to the cancel offer cancels the superseded booking once",
+      "blurb": "Say yes to 'shall I cancel it?' and the old booking is actually cancelled - once, with its reference confirmed; a second yes does nothing.",
+      "multimodal": false,
+      "score": 100.0,
+      "trace": [
+        {
+          "dir": "in",
+          "t": 0.0,
+          "kind": "chunk",
+          "text": "flight from Delhi to Mumbai tomorrow"
+        },
+        {
+          "dir": "out",
+          "args": {
+            "date": "2026-09-15",
+            "destination": "mumbai",
+            "origin": "delhi"
+          },
+          "call_id": "c1",
+          "idem_key": null,
+          "kind": "call",
+          "mutating": false,
+          "reads": [
+            "date",
+            "destination",
+            "origin"
+          ],
+          "t": 0.0,
+          "tool": "search_flights"
+        },
+        {
+          "dir": "out",
+          "kind": "say",
+          "t": 0.0,
+          "text": "One moment, checking that now."
+        },
+        {
+          "dir": "in",
+          "t": 0.9,
+          "kind": "tool_result",
+          "call_id": "c1",
+          "tool": "search_flights",
+          "args": {
+            "origin": "delhi",
+            "destination": "mumbai",
+            "date": "2026-09-15"
+          },
+          "result": {
+            "ok": true,
+            "flights": [
+              "MUM-101",
+              "MUM-204"
+            ]
+          }
+        },
+        {
+          "dir": "out",
+          "args": {
+            "flight_id": "MUM-101"
+          },
+          "call_id": "c2",
+          "idem_key": null,
+          "kind": "call",
+          "mutating": false,
+          "reads": [
+            "date",
+            "destination",
+            "origin"
+          ],
+          "t": 0.9,
+          "tool": "check_seat_availability"
+        },
+        {
+          "dir": "in",
+          "t": 1.15,
+          "kind": "tool_result",
+          "call_id": "c2",
+          "tool": "check_seat_availability",
+          "args": {
+            "flight_id": "MUM-101"
+          },
+          "result": {
+            "ok": true,
+            "flight_id": "MUM-101",
+            "seats": [
+              "MUM-101:12A",
+              "MUM-101:14C"
+            ]
+          }
+        },
+        {
+          "dir": "in",
+          "t": 1.5,
+          "kind": "chunk",
+          "text": "book it",
+          "final": true
+        },
+        {
+          "dir": "out",
+          "args": {
+            "flight_id": "MUM-101",
+            "pax": 1,
+            "seat": "MUM-101:12A"
+          },
+          "call_id": "c3",
+          "idem_key": "3d48791562976a75",
+          "kind": "call",
+          "mutating": true,
+          "reads": [
+            "date",
+            "destination",
+            "origin",
+            "pax"
+          ],
+          "t": 1.9,
+          "tool": "book_flight"
+        },
+        {
+          "dir": "in",
+          "t": 3.0,
+          "kind": "tool_result",
+          "call_id": "c3",
+          "tool": "book_flight",
+          "args": {
+            "flight_id": "MUM-101",
+            "seat": "MUM-101:12A",
+            "pax": 1
+          },
+          "result": {
+            "ok": true,
+            "booking_ref": "PNR5797"
+          }
+        },
+        {
+          "dir": "out",
+          "booked": true,
+          "kind": "final",
+          "state": {
+            "intent": "flight",
+            "slots": {
+              "commit": true,
+              "date": "2026-09-15",
+              "destination": "mumbai",
+              "origin": "delhi"
+            }
+          },
+          "t": 3.0,
+          "text": "You're booked on MUM-101, seat 12A - ref PNR5797."
+        },
+        {
+          "dir": "in",
+          "t": 5.0,
+          "kind": "chunk",
+          "text": "wait, to Goa instead",
+          "final": true
+        },
+        {
+          "dir": "out",
+          "args": {
+            "date": "2026-09-15",
+            "destination": "goa",
+            "origin": "delhi"
+          },
+          "call_id": "c4",
+          "idem_key": null,
+          "kind": "call",
+          "mutating": false,
+          "reads": [
+            "date",
+            "destination",
+            "origin"
+          ],
+          "t": 5.0,
+          "tool": "search_flights"
+        },
+        {
+          "dir": "out",
+          "kind": "say",
+          "t": 5.0,
+          "text": "One moment, checking that now."
+        },
+        {
+          "dir": "in",
+          "t": 5.9,
+          "kind": "tool_result",
+          "call_id": "c4",
+          "tool": "search_flights",
+          "args": {
+            "origin": "delhi",
+            "destination": "goa",
+            "date": "2026-09-15"
+          },
+          "result": {
+            "ok": true,
+            "flights": [
+              "GOA-101",
+              "GOA-204"
+            ]
+          }
+        },
+        {
+          "dir": "out",
+          "args": {
+            "flight_id": "GOA-101"
+          },
+          "call_id": "c5",
+          "idem_key": null,
+          "kind": "call",
+          "mutating": false,
+          "reads": [
+            "date",
+            "destination",
+            "origin"
+          ],
+          "t": 5.9,
+          "tool": "check_seat_availability"
+        },
+        {
+          "dir": "in",
+          "t": 6.15,
+          "kind": "tool_result",
+          "call_id": "c5",
+          "tool": "check_seat_availability",
+          "args": {
+            "flight_id": "GOA-101"
+          },
+          "result": {
+            "ok": true,
+            "flight_id": "GOA-101",
+            "seats": [
+              "GOA-101:12A",
+              "GOA-101:14C"
+            ]
+          }
+        },
+        {
+          "dir": "out",
+          "args": {
+            "flight_id": "GOA-101",
+            "pax": 1,
+            "seat": "GOA-101:12A"
+          },
+          "call_id": "c6",
+          "idem_key": "8a070bfa479d5fe3",
+          "kind": "call",
+          "mutating": true,
+          "reads": [
+            "date",
+            "destination",
+            "origin",
+            "pax"
+          ],
+          "t": 6.15,
+          "tool": "book_flight"
+        },
+        {
+          "dir": "in",
+          "t": 7.25,
+          "kind": "tool_result",
+          "call_id": "c6",
+          "tool": "book_flight",
+          "args": {
+            "flight_id": "GOA-101",
+            "seat": "GOA-101:12A",
+            "pax": 1
+          },
+          "result": {
+            "ok": true,
+            "booking_ref": "PNR5331"
+          }
+        },
+        {
+          "dir": "out",
+          "booked": true,
+          "kind": "final",
+          "state": {
+            "intent": "flight",
+            "slots": {
+              "commit": true,
+              "date": "2026-09-15",
+              "destination": "goa",
+              "origin": "delhi"
+            }
+          },
+          "superseded": [
+            {
+              "booking_ref": "PNR5797",
+              "flight_id": "MUM-101"
+            }
+          ],
+          "t": 7.25,
+          "text": "You're booked on GOA-101, seat 12A - ref PNR5331. Your earlier booking MUM-101 (ref PNR5797) is still active - shall I cancel it?"
+        },
+        {
+          "dir": "in",
+          "t": 9.0,
+          "kind": "chunk",
+          "text": "yes",
+          "final": true
+        },
+        {
+          "dir": "out",
+          "args": {
+            "booking_ref": "PNR5797"
+          },
+          "call_id": "c7",
+          "idem_key": "68a270701c2c2cc6",
+          "kind": "call",
+          "mutating": true,
+          "reads": [],
+          "t": 9.4,
+          "tool": "cancel_booking"
+        },
+        {
+          "dir": "in",
+          "t": 10.0,
+          "kind": "tool_result",
+          "call_id": "c7",
+          "tool": "cancel_booking",
+          "args": {
+            "booking_ref": "PNR5797"
+          },
+          "result": {
+            "ok": true,
+            "cancelled": "PNR5797"
+          }
+        },
+        {
+          "dir": "out",
+          "booked": true,
+          "kind": "final",
+          "state": {
+            "intent": "flight",
+            "slots": {
+              "commit": true,
+              "date": "2026-09-15",
+              "destination": "goa",
+              "origin": "delhi"
+            }
+          },
+          "t": 10.0,
+          "text": "You're booked on GOA-101, seat 12A - ref PNR5331. Cancelled your earlier booking MUM-101 (ref PNR5797)."
+        },
+        {
+          "dir": "in",
+          "t": 11.0,
+          "kind": "chunk",
+          "text": "yes",
+          "final": true
+        },
+        {
+          "dir": "out",
+          "booked": true,
+          "kind": "final",
+          "state": {
+            "intent": "flight",
+            "slots": {
+              "commit": true,
+              "date": "2026-09-15",
+              "destination": "goa",
+              "origin": "delhi"
+            }
+          },
+          "t": 11.0,
+          "text": "You're booked on GOA-101, seat 12A - ref PNR5331. Cancelled your earlier booking MUM-101 (ref PNR5797)."
         }
       ]
     }
