@@ -879,6 +879,30 @@ def _selfcheck():
     finally:
         _agent_mod._perception_extract = _prev_extract
 
+    # slot grounding: a model can never introduce a value the user didn't say.
+    # Reproduces the observed Groq hallucination - origin "bengaluru" invented
+    # for "wait, to Goa instead" - end to end through perception.extract.
+    import perception as _p
+    assert _p.normalize_slots({"origin": "bengaluru", "destination": "goa"},
+                              "wait, to Goa instead") == {"destination": "goa"}
+    assert _p.normalize_slots({"origin": "bangalore"}, "from Bangalore") == \
+        {"origin": "bengaluru"}, "a known alias in the text grounds the city"
+    assert _p.normalize_slots({"pax": 3}, "make it three of us") == {"pax": 3}
+    assert _p.normalize_slots({"pax": 3}, "book it") == {}
+    assert _p.normalize_slots({"date": "tomorrow"}, "fly tomorrow") == {"date": "2026-09-15"}
+    assert _p.normalize_slots({"date": "tomorrow"}, "fly soon") == {}
+    _prev_call = _p._call_llm
+    os.environ["AURA_LLM_URL"] = "http://stub.invalid"      # in-process stub, no network
+    _p._call_llm = lambda text: {"origin": "bengaluru", "destination": "goa",
+                                 "intent": "flight"}
+    try:
+        got = _p.extract({"kind": "chunk", "text": "wait, to Goa instead"})
+        assert got == {"destination": "goa", "intent": "flight"}, \
+            f"ungrounded origin must be dropped: {got}"
+    finally:
+        _p._call_llm = _prev_call
+        del os.environ["AURA_LLM_URL"]
+
     # the exported trace is JSON-clean and in the exact shape the visualiser
     # fetches: {"trace": [...]} with every entry serialisable as-is
     payload = json.loads(json.dumps({"trace": simulate(SCENARIOS[0])["trace"]}))
@@ -942,7 +966,10 @@ def _selfcheck():
 # Scrubbed only when harness.py runs as a script - importing this module
 # (the demo, an adapter) leaves the environment alone, and perception.py's
 # own behaviour when called directly is unchanged.
-_LLM_ENV = ("AURA_LLM_URL", "OPENAI_API_KEY", "GEMINI_API_KEY", "AURA_VLM_URL")
+# AURA_REF_DATE is scrubbed too: a live session exports today's date as the
+# relative-date reference, and a scored run must stay on the virtual clock.
+_LLM_ENV = ("AURA_LLM_URL", "OPENAI_API_KEY", "GEMINI_API_KEY", "AURA_VLM_URL",
+            "AURA_REF_DATE", "AURA_LLM_429_WAIT")
 
 
 def _force_hermetic():

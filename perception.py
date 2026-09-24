@@ -13,6 +13,7 @@ No dependency on agent.py (avoids circular imports).
 """
 
 import base64
+import datetime
 import io
 import json
 import os
@@ -35,33 +36,55 @@ ALLOWED_SLOTS = frozenset({"origin", "destination", "date", "pax", "intent", "co
 CITIES = {"delhi", "mumbai", "bengaluru", "bangalore", "chennai", "goa", "pune"}
 CITY_ALIASES = {"bangalore": "bengaluru"}
 
-# Benchmark evaluation clock reference:
-# Harness scenarios run on a virtual clock where simulation start t=0.0 corresponds
-# to Monday 2026-09-14. Therefore "tomorrow" -> "2026-09-15" and "friday" -> "2026-09-18".
-DATE_ALIASES = {
-    "tomorrow": "2026-09-15",
-    "friday": "2026-09-18",
-}
+# Relative dates resolve HERE, deterministically, against one reference date -
+# never in the model, whose date arithmetic flaps between calls (a repeated
+# extraction of the same sentence must yield the same date). The reference is
+# AURA_REF_DATE when set (the live server sets it to today), else the scored
+# virtual-clock epoch: Monday 2026-09-14, so "tomorrow" -> 2026-09-15 and
+# "friday" -> 2026-09-18 exactly as the harness scenarios expect.
+_WEEKDAYS = {"monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
+             "friday": 4, "saturday": 5, "sunday": 6}
+
+
+def _ref_date() -> datetime.date:
+    ref = os.getenv("AURA_REF_DATE")
+    if ref:
+        try:
+            return datetime.date.fromisoformat(ref)
+        except ValueError:
+            pass
+    return datetime.date(2026, 9, 14)
+
+
+def _resolve_date(expr: str) -> str | None:
+    e = expr.strip().lower()
+    base = _ref_date()
+    if e == "today":
+        return base.isoformat()
+    if e == "tomorrow":
+        return (base + datetime.timedelta(days=1)).isoformat()
+    if e in _WEEKDAYS:
+        ahead = (_WEEKDAYS[e] - base.weekday() - 1) % 7 + 1   # next occurrence
+        return (base + datetime.timedelta(days=ahead)).isoformat()
+    return None
 
 WORD_TO_NUM = {
     "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
     "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
 }
 
+# Trimmed for token budget (free-tier rate limits count every token). Dates
+# come back VERBATIM - the model must never compute them; we resolve them
+# deterministically in normalize_slots.
 SYSTEM_PROMPT = (
-    "You are the slot extraction module for a flight booking assistant.\n"
-    "Extract flight booking slots from the user input.\n"
-    "Return ONLY a JSON object with any of these recognized keys:\n"
-    '- "origin": departure city (e.g. "delhi", "mumbai", "pune", "bengaluru", "goa", "chennai")\n'
-    '- "destination": arrival city (e.g. "delhi", "mumbai", "pune", "bengaluru", "goa", "chennai")\n'
-    '- "date": travel date formatted as YYYY-MM-DD (e.g. "2026-09-15", "2026-09-18")\n'
-    '- "pax": integer count of passengers (e.g. 1, 2)\n'
-    '- "intent": "flight" if discussing or booking flights\n'
-    '- "commit": true if the user confirms, commits, or asks to book\n\n'
-    "Rules:\n"
-    "- Output ONLY the JSON object. No markdown code fences, no explanations.\n"
-    "- Omit unmentioned slots.\n"
-    '- Normalize city names to lowercase (e.g. "bangalore" -> "bengaluru").'
+    "Extract flight-booking slots from the user input. "
+    "Return ONLY a JSON object, no markdown, no prose; omit unmentioned keys.\n"
+    '"origin","destination": lowercase city ("bangalore"->"bengaluru").\n'
+    '"date": the user\'s own words verbatim ("tomorrow","friday") - NEVER '
+    "compute or convert a date.\n"
+    '"pax": integer passenger count.\n'
+    '"intent": "flight" if about flights.\n'
+    '"commit": true only if the user confirms or asks to book.'
 )
 
 # --- Model Singletons and Hooks ----------------------------------------------
@@ -86,10 +109,27 @@ def _get_whisper_model():
 # --- Normalization & Deterministic Fallback -----------------------------------
 
 
-def normalize_slots(raw: Any) -> dict[str, Any]:
-    """Validate and normalize extracted slots against project schema."""
+def normalize_slots(raw: Any, text: str = "") -> dict[str, Any]:
+    """Validate and normalize extracted slots against project schema, and
+    GROUND them in the utterance: an origin/destination survives only if the
+    city (or a known alias) appears in the raw text, pax only if a number or
+    number word does, a date only if its relative expression (or the literal
+    ISO date) does. A model can never introduce a value the user didn't say.
+    Deterministic, and a no-op for the keyword path, which only ever emits
+    grounded values. With no text given, grounding is skipped."""
     if not isinstance(raw, dict):
         return {}
+
+    ground = bool(text)
+    low = text.lower().replace("’", "'") if ground else ""
+    tokens = {w.strip(".,!?-'") for w in low.split()} if ground else set()
+
+    def _city_grounded(c: str) -> bool:
+        return (not ground) or c in tokens or any(
+            alias in tokens for alias, canon in CITY_ALIASES.items() if canon == c)
+
+    def _pax_grounded() -> bool:
+        return (not ground) or any(t.isdigit() or t in WORD_TO_NUM for t in tokens)
 
     out: dict[str, Any] = {}
     for k, v in raw.items():
@@ -98,17 +138,18 @@ def normalize_slots(raw: Any) -> dict[str, Any]:
 
         if k in ("origin", "destination") and isinstance(v, str):
             cleaned = CITY_ALIASES.get(v.strip().lower(), v.strip().lower())
-            if cleaned:
+            if cleaned and _city_grounded(cleaned):
                 out[k] = cleaned
 
         elif k == "date" and isinstance(v, str):
             d = v.strip().lower()
-            if d in DATE_ALIASES:
-                out["date"] = DATE_ALIASES[d]
-            elif re.match(r"^\d{4}-\d{2}-\d{2}$", d):
+            resolved = _resolve_date(d)
+            if resolved and (not ground or d in tokens):
+                out["date"] = resolved
+            elif re.match(r"^\d{4}-\d{2}-\d{2}$", d) and (not ground or d in low):
                 out["date"] = d
 
-        elif k == "pax":
+        elif k == "pax" and _pax_grounded():
             if isinstance(v, int) and v > 0:
                 out["pax"] = v
             elif isinstance(v, str):
@@ -150,9 +191,10 @@ def _fallback_extract(text: str) -> dict[str, Any]:
             out["origin"] = CITY_ALIASES.get(words[i + 1], words[i + 1])
 
     if "tomorrow" in t:
-        out["date"] = DATE_ALIASES["tomorrow"]
-    if "friday" in t:
-        out["date"] = DATE_ALIASES["friday"]
+        out["date"] = _resolve_date("tomorrow")
+    for day in _WEEKDAYS:
+        if day in t:
+            out["date"] = _resolve_date(day)
 
     for n, v in (("one", 1), ("two", 2), ("three", 3), ("four", 4)):
         if f"{n} seat" in t or f"{n} ticket" in t or f"{n} passenger" in t:
@@ -168,6 +210,8 @@ def _fallback_extract(text: str) -> dict[str, Any]:
 
 _WARNED: set = set()      # (context, kind) pairs already reported to stderr
 _LLM_OK: bool | None = None   # None = no call attempted yet
+_STATS = {"llm_ok": 0, "llm_fallback": 0}   # per-process; the --real gate reads
+                                            # these to refuse a silent fallback
 
 
 def _warn_once(context: str, exc: Exception) -> None:
@@ -213,20 +257,50 @@ _RETRY_ONCE = {429, 503}       # transient: one short backoff, same model
 _NEXT_MODEL = {404, 429, 503}  # then move down the model list
 
 
+def _retry_after(e) -> float:
+    """The provider's stated retry interval: Retry-After header, or a
+    'try again in 7.66s' style body, else a small default."""
+    try:
+        h = e.headers.get("Retry-After") if e.headers else None
+        if h:
+            return float(h)
+    except (TypeError, ValueError):
+        pass
+    try:
+        m = re.search(r"in ([0-9.]+)s", e.read(500).decode("utf-8", "replace"))
+        if m:
+            return float(m.group(1))
+    except Exception:
+        pass
+    return 2.0
+
+
 def _try_models(default_model: str, attempt, timeout: float):
     """AURA_LLM_MODEL may be a comma-separated list. 429/503 get one retry
     after a short backoff (within the timeout budget); 404/429/503 then move
-    to the next model; anything else raises immediately."""
+    to the next model; anything else raises immediately. When
+    AURA_LLM_429_WAIT is set (seconds - the --real gate sets it), a 429
+    instead waits out the provider's stated retry interval, up to that
+    budget, rather than falling back - a gate that quietly compared
+    deterministic against deterministic proved worse than a slow gate."""
     models = [m.strip() for m in os.getenv("AURA_LLM_MODEL", default_model).split(",")
               if m.strip()]
+    wait_budget = float(os.getenv("AURA_LLM_429_WAIT", "0"))
     last = None
     for model in models:
-        for attempt_no in (0, 1):
+        retried = False
+        while True:
             try:
                 return attempt(model)
             except urllib.error.HTTPError as e:
                 last = e
-                if attempt_no == 0 and e.code in _RETRY_ONCE:
+                if e.code == 429 and wait_budget > 0:
+                    delay = min(_retry_after(e) + 0.2, wait_budget)
+                    time.sleep(delay)
+                    wait_budget -= delay
+                    continue
+                if not retried and e.code in _RETRY_ONCE:
+                    retried = True
                     time.sleep(min(0.3, timeout / 4))
                     continue
                 if e.code in _NEXT_MODEL:
@@ -282,6 +356,9 @@ def _call_llm(text: str) -> dict:
                 ],
                 "temperature": 0.0,
             }
+            if "gpt-oss" in model:
+                # reasoning tokens count against the rate limit on gpt-oss
+                payload["reasoning_effort"] = "low"
             data = _post_json(url, payload, headers, timeout)
             return _parse_json_from_text(data["choices"][0]["message"]["content"])
 
@@ -312,12 +389,14 @@ def extract_text_slots(text: str) -> dict[str, Any]:
         try:
             raw_slots = _call_llm(text)
             _LLM_OK = True
-            normalized = normalize_slots(raw_slots)
+            _STATS["llm_ok"] += 1
+            normalized = normalize_slots(raw_slots, text)
             if normalized:
                 return normalized
             return _fallback_extract(text)
         except Exception as e:
             _LLM_OK = False
+            _STATS["llm_fallback"] += 1
             _warn_once("LLM extraction", e)
             return _fallback_extract(text)
 

@@ -19,8 +19,13 @@ Scored harness runs stay hermetic and are untouched by this file.
 """
 
 import asyncio
+import datetime
 import json
 import os
+
+# Live mode resolves relative dates ("tomorrow") against the real calendar;
+# scored runs keep the fixed virtual-clock date. Explicit override wins.
+os.environ.setdefault("AURA_REF_DATE", datetime.date.today().isoformat())
 
 from aiohttp import web, WSMsgType
 

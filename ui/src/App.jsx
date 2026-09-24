@@ -9,7 +9,10 @@ const SLOT_KEYS = ["origin", "destination", "date", "pax"];
 const SLOT_NAMES = { origin: "origin", destination: "destination", date: "date", pax: "passengers" };
 const STEP_SPEED = 3.5;
 const FLAGSHIP = "mid-utterance destination change";
-const PARTIAL_PAUSE_MS = 600;   // typing pause before a non-final chunk is sent
+// typing pause before a non-final chunk is sent. Raised from 600ms: each
+// partial costs an LLM extraction call, and free tiers allow ~14/minute.
+// Unchanged text is never re-sent (see onDraft).
+const PARTIAL_PAUSE_MS = 1200;
 
 const PICKER = [
   "mid-utterance destination change",

@@ -18,6 +18,12 @@ cancelled, which questions were asked, and whether an offer was left open.
 Each user turn's real extraction is printed next to the deterministic one.
 Exit is non-zero on any outcome mismatch - run this before a live demo.
 
+--real refuses to pass on tests that never reached the model: 429s wait out
+the provider's stated retry interval (AURA_LLM_429_WAIT budget) instead of
+falling back, and any case where extraction still fell back to the keyword
+path prints INCONCLUSIVE and fails the run - a PASS that compared
+deterministic against deterministic is not a pass.
+
 Deliberately NOT part of `harness.py --selfcheck`, which stays offline and
 deterministic. Stdlib only.
 
@@ -85,7 +91,12 @@ class MockLLM(BaseHTTPRequestHandler):
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         user = body["messages"][-1]["content"]
-        slots = _extract(user)                     # extracts like the keyword path...
+        slots = dict(_extract(user))               # extracts like the keyword path...
+        low = user.lower()
+        if "tomorrow" in low:
+            slots["date"] = "tomorrow"             # dates come back VERBATIM, per the
+        elif "friday" in low:                      # prompt contract - normalize_slots
+            slots["date"] = "friday"               # resolves them deterministically
         words = _clean_words(user)
         if not slots and words and words[0] in _AFFIRM:
             slots["commit"] = True                 # ...but maps a bare affirmative to
@@ -136,12 +147,18 @@ def outcome(trace):
                 cancelled.append(ref2flight.get(e["result"]["cancelled"], e["result"]["cancelled"]))
     outs = [e for e in trace if e.get("dir") == "out"]
     finals = [o for o in outs if o["kind"] == "final"]
+    # the final slot snapshot makes hallucinated slots visible: the mock
+    # airline derives flight ids from destination alone, so an invented
+    # origin or date would otherwise sail through the comparison
+    stated = [o for o in outs if o.get("state")]
+    slots = stated[-1]["state"].get("slots", {}) if stated else {}
     return {
         "booked": sorted(booked),
         "cancelled": sorted(cancelled),
         "questions_asked": [o["text"] for o in outs if o["kind"] == "clarify"],
         "final_booked": bool(finals and finals[-1].get("booked")),
         "offer_left_open": bool(finals) and finals[-1]["text"].rstrip().endswith("?"),
+        "slots": {k: slots.get(k) for k in ("origin", "destination", "date", "pax")},
     }
 
 
@@ -155,8 +172,10 @@ def main():
             raise SystemExit(2)
         provider = ("AURA_LLM_URL=" + os.environ["AURA_LLM_URL"] if os.getenv("AURA_LLM_URL")
                     else "OpenAI" if os.getenv("OPENAI_API_KEY") else "Gemini")
+        os.environ.setdefault("AURA_LLM_429_WAIT", "60")   # wait, don't fall back
         print(f"REAL mode: LLM side uses {provider}; deterministic side runs with "
-              "LLM variables stripped. Comparing OUTCOMES, not trace bytes.\n")
+              "LLM variables stripped. Comparing OUTCOMES, not trace bytes. "
+              f"429s wait up to {os.environ['AURA_LLM_429_WAIT']}s instead of falling back.\n")
         llm_url = None
     else:
         srv = HTTPServer(("127.0.0.1", 0), MockLLM)
@@ -178,9 +197,14 @@ def main():
         nonlocal ok
         saved = env_off()
         det = run(events)                          # deterministic path, always env-free
+        inconclusive = False
         if real:
             env_restore(saved)
+            fb0 = perception._STATS["llm_fallback"]
             llm = run(events)                      # live provider, ambient env
+            # a case whose extractions quietly fell back never tested the
+            # model at all - refuse to call that a PASS
+            inconclusive = perception._STATS["llm_fallback"] > fb0
         else:
             os.environ["AURA_LLM_URL"] = llm_url
             llm = run(events)                      # mock endpoint
@@ -192,11 +216,15 @@ def main():
             same = outcome(det) == outcome(llm)
         else:
             same = det == llm
-        ok &= same and behaved
-        mark = "PASS" if same and behaved else "FAIL"
+        ok &= same and behaved and not inconclusive
+        mark = ("INCONCLUSIVE" if inconclusive else
+                "PASS" if same and behaved else "FAIL")
 
         if real:
             print(f"{mark}  {name}")
+            if inconclusive:
+                print("      extraction fell back to the keyword path during this "
+                      "case - the model was never actually tested")
             for _, ev in events:                   # what each side extracted, per turn
                 text = ev.get("text", "")
                 d = _extract(text)
@@ -235,7 +263,7 @@ def main():
         print("\nall flows resolve identically" + (" (by outcome) with the live model"
                                                    if real else " with and without the LLM"))
     else:
-        print("\nMISMATCH - do not demo until the above is understood")
+        print("\nMISMATCH or INCONCLUSIVE - do not demo until the above is understood")
     raise SystemExit(0 if ok else 1)
 
 
